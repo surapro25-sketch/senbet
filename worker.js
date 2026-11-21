@@ -203,10 +203,22 @@ async function createStoredFile(body,field="file"){
 async function handler(request,env){
   const url=new URL(request.url),path=url.pathname,method=request.method;
   if(method==="GET"&&path==="/robots.txt"){
-    return new Response(`User-agent: *\nAllow: /\nDisallow: /api/\n\nSitemap: https://senbet.1surapro25.workers.dev/sitemap.xml\n`,{headers:{"content-type":"text/plain; charset=utf-8","cache-control":"public, max-age=3600"}});
+    return new Response(`User-agent: *
+Allow: /
+Disallow: /api/
+
+Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
+`,{headers:{"content-type":"text/plain; charset=utf-8","cache-control":"public, max-age=3600"}});
   }
   if(method==="GET"&&path==="/sitemap.xml"){
-    return new Response(`<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url>\n    <loc>https://senbet.1surapro25.workers.dev/</loc>\n    <changefreq>weekly</changefreq>\n    <priority>1.0</priority>\n  </url>\n</urlset>`,{headers:{"content-type":"application/xml; charset=utf-8","cache-control":"public, max-age=3600"}});
+    return new Response(`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://senbet.1surapro25.workers.dev/</loc>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>`,{headers:{"content-type":"application/xml; charset=utf-8","cache-control":"public, max-age=3600"}});
   }
   await ensureSeed(env);
   if(path==="/api/files/download"&&method==="GET")return fileResponse(request,env,"download");
