@@ -203,6 +203,9 @@ async function createStoredFile(body,field="file"){
 }
 async function handler(request,env){
   const url=new URL(request.url),path=url.pathname,method=request.method;
+  if(method==="GET"&&path==="/googleba7f61ba454e7933.html"){
+    return new Response("google-site-verification: googleba7f61ba454e7933.html",{status:200,headers:{"content-type":"text/html; charset=utf-8","cache-control":"public, max-age=3600","x-content-type-options":"nosniff"}});
+  }
   if(method==="GET"&&path==="/og-image.png"){
     const upstream=await fetch("https://raw.githubusercontent.com/surapro25-sketch/senbet/main/src/assets/images/senbet-og-image.png",{cf:{cacheEverything:true,cacheTtl:86400}});
     if(!upstream.ok)return new Response("Open Graph image not found.",{status:404});
