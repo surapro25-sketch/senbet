@@ -9,7 +9,13 @@ const err = (error,status=400) => json({error},status);
 const now = () => new Date().toISOString().replace("T"," ").slice(0,19);
 const idKey = (table,id) => table+":"+id;
 async function all(env, table) {
-  const {keys=[]}=await env.SENBET_DB.list({prefix:table+":"});
+  const keys=[];
+  let cursor;
+  do {
+    const page=await env.SENBET_DB.list({prefix:table+":",...(cursor?{cursor}:{})});
+    keys.push(...(page.keys||[]));
+    cursor=page.list_complete?undefined:page.cursor;
+  } while(cursor);
   const rows=await Promise.all(keys.map(async k=>{try{return JSON.parse(await env.SENBET_DB.get(k.name));}catch{return null;}}));
   return rows.filter(Boolean);
 }
