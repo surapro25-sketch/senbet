@@ -360,6 +360,7 @@ export function DepartmentsView({ currentUser }: DepartmentsViewProps) {
                 </h3>
                 <p className="mt-0.5 text-xs text-white/65">
                   ሪፖርትዎን በፅሁፍ ያቅርቡ እና ካለ የPDF ፋይል አያይዘው ይላኩ
+                  {" · ፋይሎች ከ21 ቀናት በኋላ በራስ-ሰር ይሰረዛሉ።"}
                 </p>
               </div>
 
@@ -668,6 +669,7 @@ export function DepartmentsView({ currentUser }: DepartmentsViewProps) {
                   {isChoirHead
                     ? 'መዝሙር ክፍል ብቻ፡ PDF፣ ኦዲዮ (Audio) እና ቪዲዮ (Video) ፋይሎችን ለአባላት መስጠት ይችላሉ።'
                     : 'ለዚህ ክፍል አባላት መስጠት የሚፈቀደው የPDF ፋይል ብቻ ነው።'}
+                  {" · ፋይሎች ከ21 ቀናት በኋላ በራስ-ሰር ይሰረዛሉ።"}
                 </p>
               </div>
 

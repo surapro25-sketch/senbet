@@ -62,6 +62,45 @@ async function withUser(env,row,field){const u=await get(env,"users",row[field])
 async function enriched(env,rows,foreign,extra){const out=[];for(const r of rows){const u=await get(env,"users",r[foreign]);out.push({...r,...(u?extra(u):{})});}return out;}
 async function getFile(env,kind,id){const table=kind==="resource"?"resources":kind==="material"?"materials":kind==="report"?"reports":null;const row=table?await get(env,table,Number(id)):null;if(!row)return null;return kind==="report"?{fileUrl:row.pdfUrl,fileName:row.pdfName||"report.pdf"}:{fileUrl:row.fileUrl,fileName:row.fileName};}
 function googleDriveScriptUrl(env){return String(env.GOOGLE_DRIVE_SCRIPT_URL||"").trim();}
+const FILE_TTL_MS=21*24*60*60*1000;
+function expirationTime(row){
+  if(Number.isFinite(Number(row?.expiresAt))&&Number(row.expiresAt)>0)return Number(row.expiresAt);
+  if(row?.createdAt){const parsed=Date.parse(String(row.createdAt).replace(" ","T")+"Z");if(Number.isFinite(parsed))return parsed+FILE_TTL_MS;}
+  return null;
+}
+function isExpired(row,at=Date.now()){const expires=expirationTime(row);return expires!==null&&expires<=at;}
+async function trashGoogleDriveFile(env,row){
+  const value=String(row?.fileUrl||row?.pdfUrl||"");
+  if(!value.startsWith("gdrive:"))return;
+  const script=googleDriveScriptUrl(env);if(!script)return;
+  try{
+    const target=new URL(script);target.searchParams.set("action","delete");target.searchParams.set("fileId",value.slice(7));
+    const response=await fetch(target.toString(),{method:"GET",redirect:"follow"});
+    if(!response.ok)console.error("Google Drive trash request failed",response.status,value.slice(7));
+  }catch(error){console.error("Google Drive trash request failed",error);}
+}
+async function purgeExpiredTable(env,table){
+  const rows=await all(env,table),expired=rows.filter(row=>isExpired(row));
+  await Promise.all(expired.map(async row=>{await trashGoogleDriveFile(env,row);await remove(env,table,row.id);}));
+  return expired.length;
+}
+async function cleanupExpiredFiles(env){
+  const counts=await Promise.all(["resources","materials","reports"].map(table=>purgeExpiredTable(env,table)));
+  return counts.reduce((sum,count)=>sum+count,0);
+}
+async function createGoogleDriveUploadSession(env,{fileName,mimeType,fileSize}){
+  const script=googleDriveScriptUrl(env);if(!script)return err("የGoogle Drive ማገናኛ አልተዋቀረም።",503);
+  try{
+    const sessionEndpoint=new URL(script);sessionEndpoint.searchParams.set("action","createUploadSession");
+    const upstream=await fetch(sessionEndpoint.toString(),{method:"POST",headers:{"content-type":"text/plain;charset=utf-8"},body:JSON.stringify({fileName,mimeType,fileSize}),redirect:"follow"});
+    const raw=await upstream.text();let result=null;try{result=raw?JSON.parse(raw):null;}catch{}
+    if(!upstream.ok||!result||result.error)return err(result?.error||result?.message||"Google Drive የመጫኛ ክፍለ ጊዜ መፍጠር አልቻለም።",502);
+    const uploadUrl=String(result.uploadUrl||"").trim();
+    if(!uploadUrl)return err("Google Drive የመጫኛ URL አልመለሰም።",502);
+    const parsed=new URL(uploadUrl);if(parsed.protocol!=="https:"||!/(^|\.)googleapis\.com$/i.test(parsed.hostname))return err("Google Drive የመጫኛ URL ትክክል አይደለም።",502);
+    return json({uploadUrl});
+  }catch(error){console.error("Google Drive upload session failed",error);return err("Google Drive የመጫኛ ክፍለ ጊዜ መፍጠር አልቻለም።",502);}
+}
 async function uploadToGoogleDrive(env,payload){
   const script=googleDriveScriptUrl(env);
   if(!script)return err("የGoogle Drive ማገናኛ አልተዋቀረም።",503);
@@ -84,7 +123,11 @@ async function fileResponse(request,env,kind){
   const url=new URL(request.url),type=kind==="preview"?"inline":"attachment";
   const entityKind=url.searchParams.get("kind"),id=url.searchParams.get("id"),raw=url.searchParams.get("file"),name=url.searchParams.get("name");
   let target=null,filename=name||"download";
-  if(entityKind&&id){target=await getFile(env,entityKind,id);if(!target)return err("ፋይሉ አልተገኘም።",404);filename=target.fileName||filename;}
+  if(entityKind&&id){
+    const table=entityKind==="resource"?"resources":entityKind==="material"?"materials":entityKind==="report"?"reports":null;
+    if(table)await purgeExpiredTable(env,table);
+    target=await getFile(env,entityKind,id);if(!target)return err("ፋይሉ አልተገኘም።",404);filename=target.fileName||filename;
+  }
   else if(raw){target={fileUrl:"/uploads/"+safeName(raw),fileName:safeName(raw)};filename=name||target.fileName;}
   else return err("የፋይል መለያ አልተሰጠም።",400);
   const value=target.fileUrl||"";
@@ -116,6 +159,7 @@ async function handler(request,env){
   if(path==="/api/files/download"&&method==="GET")return fileResponse(request,env,"download");
   if(path==="/api/files/preview"&&method==="GET")return fileResponse(request,env,"preview");
   if(path==="/api/public/overview"&&method==="GET"){
+    await purgeExpiredTable(env,"resources");
     const users=await all(env,"users"),resources=await all(env,"resources");
     return json({stats:{studentCount:users.filter(x=>x.role==="student").length,teacherCount:users.filter(x=>x.role==="teacher").length,resourceCount:resources.length,memberCount:users.filter(x=>["dept_head","dept_member"].includes(x.role)).length}});
   }
@@ -123,6 +167,12 @@ async function handler(request,env){
   const a=await auth(request,env),needsAuth=!["/api/auth/login","/api/auth/register-student"].includes(path);
   if(needsAuth&&a.error)return err(a.error,a.status);
   const actor=a.user;
+  if(path==="/api/files/upload-session"&&method==="POST"){
+    if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
+    const fileName=safeName(body.fileName),mimeType=String(body.mimeType||"application/octet-stream").trim(),fileSize=Number(body.fileSize);
+    if(!fileName||!Number.isSafeInteger(fileSize)||fileSize<=0)return err("የፋይል መረጃው ትክክል አይደለም።",400);
+    return createGoogleDriveUploadSession(env,{fileName,mimeType,fileSize});
+  }
   if(path==="/api/files/upload"&&method==="POST"){
     const fileName=safeName(body.fileName),mimeType=String(body.mimeType||"application/octet-stream").trim(),base64=String(body.base64||"").trim();
     if(!fileName||!base64||!/^[A-Za-z0-9+/]*={0,2}$/.test(base64))return err("የፋይል መረጃው ትክክል አይደለም።",400);
@@ -140,6 +190,7 @@ async function handler(request,env){
   // Admin stats
   if(path==="/api/admin/stats"&&method==="GET"){
     if(actor.role!=="head")return err("የአስተዳደር ስታቲስቲክስን ለማየት የሀላፊ ፈቃድ ያስፈልጋል።",403);
+    await Promise.all(["resources","reports"].map(table=>purgeExpiredTable(env,table)));
     const users=await all(env,"users"),resources=await all(env,"resources"),reports=await all(env,"reports"),atts=await all(env,"attendance");
     const students=users.filter(u=>u.role==="student"),studentsPerGrade=Array.from({length:12},(_,i)=>{const g=i+1;return {grade:g,label:g+"ኛ ክፍል",division:division(g),count:students.filter(s=>s.assignedGrade===g).length};});
     const divisionTotals=[["wetani","ወጣኒ (1ኛ - 4ኛ)"],["maekelawi","ማእከላዊ (5ኛ - 6ኛ)"],["wetat","ወጣት (7ኛ - 12ኛ)"]].map(([d,label])=>({division:d,label,count:studentsPerGrade.filter(x=>x.division===d).reduce((n,x)=>n+x.count,0)}));
@@ -203,6 +254,7 @@ async function handler(request,env){
   }
   // Educational resources
   if(path==="/api/resources"&&method==="GET"){
+    await purgeExpiredTable(env,"resources");
     let rows=await enriched(env,await all(env,"resources"),"uploadedBy",u=>({uploaderName:u.fullName,uploaderRole:u.role}));rows.sort(sortNewest);
     if(actor.role==="student"&&actor.assignedGrade){const d=division(actor.assignedGrade);rows=rows.filter(r=>(r.targetGrade==null&&["all",d].includes(r.targetDivision))||r.targetGrade===actor.assignedGrade).map(r=>({...r,fileUrl:"/api/files/download?kind=resource&id="+r.id}));}
     return json({resources:rows});
@@ -213,7 +265,7 @@ async function handler(request,env){
     const file=await createStoredFile(body);if(!file)return err("እባክዎ ፋይል (PDF፣ Audio ወይም Video) ይምረጡ።");
     if(!file.resourceType)return err("የተፈቀዱት የፋይል አይነቶች PDF፣ Audio እና Video ብቻ ናቸው።");
     let grade=body.targetGrade?Number(body.targetGrade):null,div=body.targetDivision||"all";if(actor.role==="teacher"&&actor.assignedGrade&&!grade&&div==="all")grade=actor.assignedGrade;if(grade)div=division(grade);
-    const id=await nextId(env,"resources"),r={id,title:String(body.title).trim(),description:String(body.description||"").trim(),resourceType:file.resourceType,fileUrl:file.fileUrl,fileName:file.fileName,targetGrade:grade,targetDivision:div,uploadedBy:actor.id,createdAt:now()};await put(env,"resources",r);return json({resource:{...r,uploaderName:actor.fullName,uploaderRole:actor.role}},201);
+    const id=await nextId(env,"resources"),r={id,title:String(body.title).trim(),description:String(body.description||"").trim(),resourceType:file.resourceType,fileUrl:file.fileUrl,fileName:file.fileName,targetGrade:grade,targetDivision:div,uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"resources",r);return json({resource:{...r,uploaderName:actor.fullName,uploaderRole:actor.role}},201);
   }
   if(idMatch&&idMatch[1]==="resources"&&method==="DELETE"){
     const id=Number(idMatch[2]),r=await get(env,"resources",id);if(!r)return err("ግብአቱ አልተገኘም።",404);if(actor.role!=="head"&&r.uploadedBy!==actor.id)return err("ይህን ግብአት ለመሰረዝ ፈቃድ የለዎትም።",403);await remove(env,"resources",id);return json({ok:true});
@@ -257,13 +309,14 @@ async function handler(request,env){
   }
   // Reports
   if(path==="/api/reports"&&method==="GET"){
+    await purgeExpiredTable(env,"reports");
     let rows=await enriched(env,await all(env,"reports"),"submittedBy",u=>({submitterName:u.fullName}));if(actor.role==="head"){}else if(actor.role==="dept_head"&&actor.department)rows=rows.filter(x=>x.department===actor.department);else rows=[];rows.sort(sortNewest);return json({reports:rows});
   }
   if(path==="/api/reports"&&method==="POST"){
     if(actor.role!=="dept_head"||!actor.department)return err("ሪፖርት ማቅረብ የሚችሉት የክፍል ተመዳቢ ሀላፊዎች ብቻ ናቸው።",403);
     if(!body.title||!body.content)return err("እባክዎ የሪፖርቱን ርዕስና የፅሁፍ ዝርዝር ያስገቡ።");
     let pdfUrl=null,pdfName=null;if(body.originalFileName||body.googleDriveFileId){const f=await createStoredFile({...body,resourceType:"pdf"});if(!f||f.resourceType!=="pdf")return err("ለሪፖርት ማያያዣ የተፈቀደው PDF ፋይል ብቻ ነው።");pdfUrl=f.fileUrl;pdfName=f.fileName;}
-    const id=await nextId(env,"reports"),r={id,department:actor.department,submittedBy:actor.id,title:String(body.title).trim(),content:String(body.content).trim(),pdfUrl,pdfName,status:"pending",createdAt:now()};await put(env,"reports",r);return json({report:{...r,submitterName:actor.fullName}},201);
+    const id=await nextId(env,"reports"),r={id,department:actor.department,submittedBy:actor.id,title:String(body.title).trim(),content:String(body.content).trim(),pdfUrl,pdfName,status:"pending",createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"reports",r);return json({report:{...r,submitterName:actor.fullName}},201);
   }
   if(idMatch&&idMatch[1]==="reports"&&method==="PATCH"){if(actor.role!=="head")return err("ፈቃድ የለዎትም።",403);const r=await get(env,"reports",Number(idMatch[2]));if(r){r.status=body.status==="reviewed"?"reviewed":"pending";await put(env,"reports",r);}return json({ok:true});}
   // Directives
@@ -280,6 +333,7 @@ async function handler(request,env){
   }
   // Department materials
   if(path==="/api/dept-materials"&&method==="GET"){
+    await purgeExpiredTable(env,"materials");
     let rows=await enriched(env,await all(env,"materials"),"uploadedBy",u=>({uploaderName:u.fullName}));if(actor.role==="head"){}else if(["dept_head","dept_member"].includes(actor.role)&&actor.department){rows=rows.filter(m=>m.department===actor.department);if(actor.role==="dept_member")rows=rows.map(m=>({...m,fileUrl:"/api/files/download?kind=material&id="+m.id}));}else rows=[];rows.sort(sortNewest);return json({materials:rows});
   }
   if(path==="/api/dept-materials"&&method==="POST"){
@@ -287,7 +341,7 @@ async function handler(request,env){
     if(!body.title||!body.originalFileName&&!body.googleDriveFileId)return err("እባክዎ ርዕስና ፋይል ያስገቡ።");
     const f=await createStoredFile(body);if(!f||!f.resourceType)return err("የማይታወቅ የፋይል አይነት ነው።");
     const dept=await get(env,"departments",actor.department),allows=dept?Boolean(dept.allowsMedia):actor.department==="choir";if(!allows&&f.resourceType!=="pdf")return err("ለዚህ ክፍል ለአባላት መስጠት የሚፈቀደው የPDF ፋይል ብቻ ነው። (ኦዲዮና ቪዲዮ ለመዝሙር ክፍል ወይም ለተፈቀደለት ክፍል ብቻ ነው)");
-    const id=await nextId(env,"materials"),m={id,department:actor.department,title:String(body.title).trim(),description:String(body.description||"").trim(),fileType:f.resourceType,fileUrl:f.fileUrl,fileName:f.fileName,uploadedBy:actor.id,createdAt:now()};await put(env,"materials",m);return json({material:{...m,uploaderName:actor.fullName}},201);
+    const id=await nextId(env,"materials"),m={id,department:actor.department,title:String(body.title).trim(),description:String(body.description||"").trim(),fileType:f.resourceType,fileUrl:f.fileUrl,fileName:f.fileName,uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"materials",m);return json({material:{...m,uploaderName:actor.fullName}},201);
   }
   if(idMatch&&idMatch[1]==="dept-materials"&&method==="DELETE"){
     const id=Number(idMatch[2]),m=await get(env,"materials",id);if(!m)return err("ፋይሉ አልተገኘም።",404);if(actor.role!=="head"&&m.uploadedBy!==actor.id)return err("ፈቃድ የለዎትም።",403);await remove(env,"materials",id);return json({ok:true});
@@ -322,4 +376,8 @@ async function handler(request,env){
   if(env.ASSETS){const asset=await env.ASSETS.fetch(request);if(asset.status!==404)return asset;const index=await env.ASSETS.fetch(new Request(new URL("/index.html",request.url),request));if(index.ok)return index;return asset;}
   return new Response("Frontend assets binding ASSETS is unavailable.",{status:500});
 }
-export default {async fetch(request,env){try{return await handler(request,env);}catch(e){console.error("SENBET Worker error",e);if(new URL(request.url).pathname.startsWith("/api/"))return err("የአገልጋይ ስህተት ተከስቷል።",500);return new Response("Internal Server Error",{status:500});}}};
+export async function scheduled(event,env,ctx){ctx.waitUntil(cleanupExpiredFiles(env));}
+export default {
+  async fetch(request,env){try{return await handler(request,env);}catch(e){console.error("SENBET Worker error",e);if(new URL(request.url).pathname.startsWith("/api/"))return err("የአገልጋይ ስህተት ተከስቷል።",500);return new Response("Internal Server Error",{status:500});}},
+  async scheduled(event,env,ctx){ctx.waitUntil(cleanupExpiredFiles(env));}
+};

@@ -15,6 +15,9 @@
       "id": "3a5904c8a80e4322ab5ab2328f84e2cb"
     }
   ],
+  "triggers": {
+    "crons": ["0 3 * * *"]
+  },
   "observability": {
     "enabled": true,
     "traces": { "enabled": true, "head_sampling_rate": 0.1 }

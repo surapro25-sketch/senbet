@@ -171,6 +171,7 @@ export function ResourcesView({ currentUser }: ResourcesViewProps) {
           <div className="border-b border-white/15 pb-3">
             <h3 className="text-sm font-bold text-white">አዲስ የትምህርት ግብአት መጫኛ</h3>
             <p className="text-xs text-white/65">PDF፣ Audio (MP3/WAV/M4A) ወይም Video (MP4/WEBM) ፋይል ይምረጡ</p>
+            <p className="mt-1 text-[11px] text-amber-200/80">ፋይሎች ከ21 ቀናት (3 ሳምንታት) በኋላ በራስ-ሰር ይሰረዛሉ። መጫኑ ቀጥታ እና በደረጃ ይከታተላል።</p>
           </div>
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">

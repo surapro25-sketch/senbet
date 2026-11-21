@@ -132,30 +132,75 @@ function readFileAsBase64(
   });
 }
 
+function uploadFileDirectToGoogleDrive(
+  file: File,
+  uploadUrl: string,
+  onProgress?: (percent: number) => void
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', uploadUrl, true);
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+    xhr.setRequestHeader('Content-Range', `bytes 0-${file.size - 1}/${file.size}`);
+    xhr.timeout = 0;
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress?.(Math.min(97, Math.round((event.loaded / event.total) * 97)));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Google Drive ቀጥታ መጫን አልተቻለም። እባክዎ የኔትወርክ ግንኙነትዎን ያረጋግጡ።'));
+    xhr.ontimeout = () => reject(new Error('የGoogle Drive መጫን ጊዜው አልፏል።'));
+    xhr.onload = () => {
+      let parsed: any = null;
+      try { parsed = xhr.responseText ? JSON.parse(xhr.responseText) : null; } catch { parsed = null; }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(new Error(parsed?.error?.message || parsed?.error || `Google Drive HTTP ${xhr.status}`));
+        return;
+      }
+      const fileId = typeof parsed?.id === 'string' ? parsed.id.trim() : typeof parsed?.fileId === 'string' ? parsed.fileId.trim() : '';
+      if (!fileId) {
+        reject(new Error('Google Drive የፋይል መለያ (fileId) አልመለሰም።'));
+        return;
+      }
+      onProgress?.(98);
+      resolve(fileId);
+    };
+    xhr.send(file);
+  });
+}
+
 export async function uploadFileToGoogleDriveIfConfigured(
   file: File,
   onProgress?: (percent: number) => void
 ): Promise<GoogleDriveUploadResult | null> {
   onProgress?.(1);
   const mimeType = file.type || 'application/octet-stream';
-  const base64 = await readFileAsBase64(file, onProgress);
-  const data = await apiFetch<{ fileId?: string }>('/api/files/upload', {
-    method: 'POST',
-    body: JSON.stringify({
-      fileName: file.name,
-      mimeType,
-      base64,
-    }),
-  });
-  const fileId = typeof data?.fileId === 'string' ? data.fileId.trim() : '';
-  if (!fileId) {
-    throw new Error('Google Drive የፋይል መለያ (fileId) አልመለሰም።');
+  let fileId = '';
+
+  // Prefer a resumable session; only fall back to the Worker proxy if session creation fails.
+  let uploadUrl = '';
+  try {
+    const session = await apiFetch<{ uploadUrl?: string }>('/api/files/upload-session', {
+      method: 'POST',
+      body: JSON.stringify({ fileName: file.name, mimeType, fileSize: file.size }),
+    });
+    uploadUrl = typeof session?.uploadUrl === 'string' ? session.uploadUrl : '';
+    if (!uploadUrl) throw new Error('Google Drive upload session URL was not returned.');
+  } catch (sessionError) {
+    console.warn('Resumable upload session unavailable; using proxy upload fallback.', sessionError);
+    const base64 = await readFileAsBase64(file, onProgress);
+    const fallback = await apiFetch<{ fileId?: string }>('/api/files/upload', {
+      method: 'POST',
+      body: JSON.stringify({ fileName: file.name, mimeType, base64 }),
+    });
+    fileId = typeof fallback?.fileId === 'string' ? fallback.fileId.trim() : '';
   }
-  onProgress?.(98);
-  return {
-    googleDriveFileId: fileId,
-    originalFileName: file.name,
-    mimeType,
-  };
+
+  if (uploadUrl) {
+    fileId = await uploadFileDirectToGoogleDrive(file, uploadUrl, onProgress);
+  }
+  if (!fileId) throw new Error('Google Drive የፋይል መለያ (fileId) አልመለሰም።');
+  onProgress?.(99);
+  return { googleDriveFileId: fileId, originalFileName: file.name, mimeType };
 }
 
