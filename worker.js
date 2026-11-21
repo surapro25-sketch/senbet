@@ -180,8 +180,14 @@ async function createStoredFile(body,field="file"){
   return {fileUrl:"gdrive:"+drive,fileName:name,resourceType:resourceType(name,mime,body.resourceType||body.fileType)};
 }
 async function handler(request,env){
-  await ensureSeed(env);
   const url=new URL(request.url),path=url.pathname,method=request.method;
+  if(method==="GET"&&path==="/robots.txt"){
+    return new Response("User-agent: *\\nAllow: /\\nDisallow: /api/\\n\\nSitemap: https://senbet.1surapro25.workers.dev/sitemap.xml\\n",{headers:{"content-type":"text/plain; charset=utf-8","cache-control":"public, max-age=3600"}});
+  }
+  if(method==="GET"&&path==="/sitemap.xml"){
+    return new Response('<?xml version="1.0" encoding="UTF-8"?>\\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://senbet.1surapro25.workers.dev/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url></urlset>',{headers:{"content-type":"application/xml; charset=utf-8","cache-control":"public, max-age=3600"}});
+  }
+  await ensureSeed(env);
   if(path==="/api/files/download"&&method==="GET")return fileResponse(request,env,"download");
   if(path==="/api/files/preview"&&method==="GET")return fileResponse(request,env,"preview");
   if(path==="/api/public/overview"&&method==="GET"){
