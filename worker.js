@@ -52,7 +52,8 @@ async function ensureSeed(env){
   await env.SENBET_DB.put("seq:users","1");
   await env.SENBET_DB.put("meta:initialized","1");
 }
-async function hashPassword(password,saltBytes){const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveBits"]);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt:saltBytes,iterations:120000,hash:"SHA-256"},key,256);return Array.from(new Uint8Array(bits)).map(x=>x.toString(16).padStart(2,"0")).join("");}
+const PBKDF2_ITERATIONS=100000;
+async function hashPassword(password,saltBytes){const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveBits"]);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt:saltBytes,iterations:PBKDF2_ITERATIONS,hash:"SHA-256"},key,256);return Array.from(new Uint8Array(bits)).map(x=>x.toString(16).padStart(2,"0")).join("");}
 async function verifyPassword(user,password){if(user.passwordHash&&user.passwordSalt){return await hashPassword(password,new Uint8Array(user.passwordSalt))===user.passwordHash;}return user.password===password;}
 async function makeToken(env,userId){const token=Array.from(crypto.getRandomValues(new Uint8Array(24))).map(x=>x.toString(16).padStart(2,"0")).join("");await put(env,"sessions",{id:token,token,userId,createdAt:now()});return token;}
 async function auth(req,env){const token=(req.headers.get("authorization")||"").startsWith("Bearer ")?req.headers.get("authorization").slice(7).trim():"";if(!token)return {error:"እባክዎ መጀመሪያ ወደ ስርዓቱ ይግቡ።",status:401};const s=await get(env,"sessions",token);const u=s?await get(env,"users",s.userId):null;if(!u)return {error:"የመግቢያ ጊዜዎ አብቅቷል፤ እባክዎ እንደገና ይግቡ።",status:401};return {user:u,token};}
