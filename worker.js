@@ -204,7 +204,7 @@ async function handler(request,env){
     if(!fileName||!base64||!/^[A-Za-z0-9+/]*={0,2}$/.test(base64))return err("የፋይል መረጃው ትክክል አይደለም።",400);
     return uploadToGoogleDrive(env,{fileName,mimeType,base64});
   }
-  const idMatch=path.match(/^\/api\/(users|resources|exams|reports|directives|dept-materials)\/(\d+)$/);
+  const idMatch=path.match(/^\/api\/(users|resources|exams|reports|directives|dept-materials|departments\/materials|departments\/reports)\/(\d+)$/);
   // Departments
   if(path==="/api/departments"&&method==="GET"){const rows=(await all(env,"departments")).sort((x,y)=>String(x.createdAt).localeCompare(String(y.createdAt)));return json({departments:rows.map(d=>({...d,allowsMedia:Boolean(d.allowsMedia)}))});}
   if(path==="/api/departments"&&method==="POST"){
@@ -346,8 +346,8 @@ async function handler(request,env){
     let pdfUrl=null,pdfName=null;if(body.originalFileName||body.googleDriveFileId){const f=await createStoredFile({...body,resourceType:"pdf"});if(!f||f.resourceType!=="pdf")return err("ለሪፖርት ማያያዣ የተፈቀደው PDF ፋይል ብቻ ነው።");pdfUrl=f.fileUrl;pdfName=f.fileName;}
     const id=await nextId(env,"reports"),r={id,department:actor.department,submittedBy:actor.id,title:String(body.title).trim(),content:String(body.content).trim(),pdfUrl,pdfName,status:"pending",createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"reports",r);return json({report:{...r,submitterName:actor.fullName}},201);
   }
-  if(idMatch&&idMatch[1]==="reports"&&method==="PATCH"){if(actor.role!=="head")return err("ፈቃድ የለዎትም።",403);const r=await get(env,"reports",Number(idMatch[2]));if(r){r.status=body.status==="reviewed"?"reviewed":"pending";await put(env,"reports",r);}return json({ok:true});}
-  if(idMatch&&idMatch[1]==="reports"&&method==="DELETE"){
+  if(idMatch&&["reports","departments/reports"].includes(idMatch[1])&&method==="PATCH"){if(actor.role!=="head")return err("ፈቃድ የለዎትም።",403);const r=await get(env,"reports",Number(idMatch[2]));if(r){r.status=body.status==="reviewed"?"reviewed":"pending";await put(env,"reports",r);}return json({ok:true});}
+  if(idMatch&&["reports","departments/reports"].includes(idMatch[1])&&method==="DELETE"){
     const id=Number(idMatch[2]),r=await get(env,"reports",id);if(!r)return err("ሪፖርቱ አልተገኘም።",404);if(actor.role!=="head"&&!(actor.role==="dept_head"&&r.submittedBy===actor.id))return err("ይህን ሪፖርት ለመሰረዝ ፈቃድ የለዎትም።",403);
     try{await trashGoogleDriveFile(env,r);}catch(error){console.error("Report Google Drive trash failed",error);return err("Google Drive ፋይሉን ወደ Trash ማንቀሳቀስ አልተቻለም፤ መዝገቡ አልተሰረዘም።",502);}
     await remove(env,"reports",id);return json({ok:true});
@@ -376,7 +376,7 @@ async function handler(request,env){
     const dept=await get(env,"departments",actor.department),allows=dept?Boolean(dept.allowsMedia):actor.department==="choir";if(!allows&&f.resourceType!=="pdf")return err("ለዚህ ክፍል ለአባላት መስጠት የሚፈቀደው የPDF ፋይል ብቻ ነው። (ኦዲዮና ቪዲዮ ለመዝሙር ክፍል ወይም ለተፈቀደለት ክፍል ብቻ ነው)");
     const id=await nextId(env,"materials"),m={id,department:actor.department,title:String(body.title).trim(),description:String(body.description||"").trim(),fileType:f.resourceType,fileUrl:f.fileUrl,fileName:f.fileName,uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"materials",m);return json({material:{...m,uploaderName:actor.fullName}},201);
   }
-  if(idMatch&&idMatch[1]==="dept-materials"&&method==="DELETE"){
+  if(idMatch&&["dept-materials","departments/materials"].includes(idMatch[1])&&method==="DELETE"){
     const id=Number(idMatch[2]),m=await get(env,"materials",id);if(!m)return err("ፋይሉ አልተገኘም።",404);if(actor.role!=="head"&&m.uploadedBy!==actor.id)return err("ፈቃድ የለዎትም።",403);
     try{await trashGoogleDriveFile(env,m);}catch(error){console.error("Material Google Drive trash failed",error);return err("Google Drive ፋይሉን ወደ Trash ማንቀሳቀስ አልተቻለም፤ መዝገቡ አልተሰረዘም።",502);}
     await remove(env,"materials",id);return json({ok:true});
