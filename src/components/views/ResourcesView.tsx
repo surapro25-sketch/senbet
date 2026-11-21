@@ -5,6 +5,7 @@ import { apiFetch, getEntityDownloadUrl, uploadFileToGoogleDriveIfConfigured } f
 import { DIVISIONS, getDivisionLabel, getGradeLabel, GRADES, ROLE_LABELS } from '../../utils/school';
 import type { DivisionId, EducationalResource, ResourceType, UserRecord } from '../../types';
 import { MediaPreviewModal } from '../MediaPreviewModal';
+import { fuzzySearch } from '../../utils/fuzzySearch';
 
 interface ResourcesViewProps {
   currentUser: UserRecord;
@@ -124,20 +125,17 @@ export function ResourcesView({ currentUser }: ResourcesViewProps) {
     }
   }
 
-  const filtered = resources.filter((r) => {
+  const searchableResources = resources.filter((r) => {
     if (!r || typeof r.id !== 'number') return false;
-    if (!isReceiver && typeFilter !== 'all' && r.resourceType !== typeFilter) return false;
-    if (search.trim()) {
-      const q = search.toLowerCase();
-      return (
-        (r.title || '').toLowerCase().includes(q) ||
-        (r.fileName || '').toLowerCase().includes(q) ||
-        (r.description || '').toLowerCase().includes(q) ||
-        (!isReceiver && (r.uploaderName || '').toLowerCase().includes(q))
-      );
-    }
-    return true;
+    return isReceiver || typeFilter === 'all' || r.resourceType === typeFilter;
   });
+  const resourceSearch = fuzzySearch(
+    search,
+    searchableResources,
+    (r) => [r.title, r.fileName, r.description, !isReceiver ? r.uploaderName : ''].filter(Boolean).join(' '),
+    (r) => r.title || r.fileName || '',
+  );
+  const filtered = search.trim() ? resourceSearch.matches : searchableResources;
 
   return (
     <div className="space-y-6">
@@ -325,6 +323,16 @@ export function ResourcesView({ currentUser }: ResourcesViewProps) {
           className="glass-input w-full max-w-xs px-3.5 py-2 text-xs"
         />
       </div>
+
+      {search.trim() && resourceSearch.suggestion && !resourceSearch.exactMatch && (
+        <p className="px-1 text-xs text-amber-100/90" role="status">
+          ምናልባት ይህን ፈልገው ይሆን? / Did you mean:{' '}
+          <button type="button" onClick={() => setSearch(resourceSearch.suggestion || '')} className="font-semibold text-amber-300 underline decoration-amber-300/60 underline-offset-2 hover:text-amber-200">
+            {resourceSearch.suggestion}
+          </button>
+          ?
+        </p>
+      )}
 
       {/* Resource List */}
       {loading ? (
