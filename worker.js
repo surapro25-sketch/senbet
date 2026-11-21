@@ -61,6 +61,7 @@ const joinedUser=(row,u,fields={})=>({...row,...fields});
 async function withUser(env,row,field){const u=await get(env,"users",row[field]);return u?{...row,[field==="uploadedBy"?"uploaderName":field==="submittedBy"?"submitterName":"senderName"]:u.fullName,...(field==="uploadedBy"?{uploaderRole:u.role}:{})}:row;}
 async function enriched(env,rows,foreign,extra){const out=[];for(const r of rows){const u=await get(env,"users",r[foreign]);out.push({...r,...(u?extra(u):{})});}return out;}
 async function getFile(env,kind,id){const table=kind==="resource"?"resources":kind==="material"?"materials":kind==="report"?"reports":null;const row=table?await get(env,table,Number(id)):null;if(!row)return null;return kind==="report"?{fileUrl:row.pdfUrl,fileName:row.pdfName||"report.pdf"}:{fileUrl:row.fileUrl,fileName:row.fileName};}
+function googleDriveScriptUrl(env){return String(env.GOOGLE_DRIVE_SCRIPT_URL||"").trim();}
 async function fileResponse(request,env,kind){
   const url=new URL(request.url),type=kind==="preview"?"inline":"attachment";
   const entityKind=url.searchParams.get("kind"),id=url.searchParams.get("id"),raw=url.searchParams.get("file"),name=url.searchParams.get("name");
@@ -70,7 +71,7 @@ async function fileResponse(request,env,kind){
   else return err("የፋይል መለያ አልተሰጠም።",400);
   const value=target.fileUrl||"";
   if(value.startsWith("gdrive:")){
-    const script=(env.GOOGLE_DRIVE_SCRIPT_URL||"").trim(),fid=value.slice(7);
+    const script=googleDriveScriptUrl(env),fid=value.slice(7);
     try{
       let upstream;
       if(script){const sep=script.includes("?")?"&":"?";upstream=await fetch(script+sep+"fileId="+encodeURIComponent(fid),{redirect:"follow"});}
@@ -175,7 +176,7 @@ async function handler(request,env){
     const targetId=Number(idMatch[2]);if(actor.role!=="head")return err("መለያ ለመሰረዝ የሀላፊ ፈቃድ ያስፈልጋል።",403);if(actor.id===targetId)return err("የራስዎን ዋና ሀላፊ መለያ መሰረዝ አይችሉም።");await remove(env,"users",targetId);for(const s of await all(env,"sessions"))if(s.userId===targetId)await remove(env,"sessions",s.token);return json({ok:true});
   }
   if(path==="/api/files/upload-config"&&method==="GET"){
-    if(!["head","teacher","dept_head"].includes(actor.role))return json({enabled:false,scriptUrl:null});const script=(env.GOOGLE_DRIVE_SCRIPT_URL||"").trim();return json({enabled:!!script,scriptUrl:script||null});
+    if(!["head","teacher","dept_head"].includes(actor.role))return json({enabled:false,scriptUrl:null});const script=googleDriveScriptUrl(env);return json({enabled:!!script,scriptUrl:script||null});
   }
   // Educational resources
   if(path==="/api/resources"&&method==="GET"){
