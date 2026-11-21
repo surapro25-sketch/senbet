@@ -79,7 +79,7 @@ function extractGoogleDriveFileId(row){
     const parsed=new URL(value);
     const host=parsed.hostname.toLowerCase();
     if(host==="drive.google.com"||host.endsWith(".drive.google.com")||host==="docs.google.com"){
-      const pathMatch=parsed.pathname.match(/\\/d\\/([A-Za-z0-9_-]{10,})/);
+      const pathMatch=parsed.pathname.match(/\/d\/([A-Za-z0-9_-]{10,})/);
       if(pathMatch)return pathMatch[1];
       const queryId=parsed.searchParams.get("id");
       if(queryId&&/^[A-Za-z0-9_-]{10,}$/.test(queryId))return queryId;
