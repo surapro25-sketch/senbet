@@ -62,6 +62,24 @@ async function withUser(env,row,field){const u=await get(env,"users",row[field])
 async function enriched(env,rows,foreign,extra){const out=[];for(const r of rows){const u=await get(env,"users",r[foreign]);out.push({...r,...(u?extra(u):{})});}return out;}
 async function getFile(env,kind,id){const table=kind==="resource"?"resources":kind==="material"?"materials":kind==="report"?"reports":null;const row=table?await get(env,table,Number(id)):null;if(!row)return null;return kind==="report"?{fileUrl:row.pdfUrl,fileName:row.pdfName||"report.pdf"}:{fileUrl:row.fileUrl,fileName:row.fileName};}
 function googleDriveScriptUrl(env){return String(env.GOOGLE_DRIVE_SCRIPT_URL||"").trim();}
+async function uploadToGoogleDrive(env,payload){
+  const script=googleDriveScriptUrl(env);
+  if(!script)return err("የGoogle Drive ማገናኛ አልተዋቀረም።",503);
+  try{
+    const upstream=await fetch(script,{method:"POST",headers:{"content-type":"text/plain;charset=utf-8"},body:JSON.stringify(payload),redirect:"follow"});
+    const raw=await upstream.text();
+    let result=null;
+    try{result=raw?JSON.parse(raw):null;}catch{}
+    if(!upstream.ok)return err(result?.error||result?.message||"Google Drive ላይ ፋይሉን መጫን አልተቻለም።",502);
+    if(!result||result.error||result.status==="error")return err(result?.error||result?.message||"Google Drive ትክክለኛ ምላሽ አልመለሰም።",502);
+    const fileId=typeof result.fileId==="string"&&result.fileId.trim()?result.fileId.trim():typeof result.id==="string"&&result.id.trim()?result.id.trim():"";
+    if(!fileId)return err("Google Drive የፋይል መለያ (fileId) አልመለሰም።",502);
+    return json({fileId});
+  }catch(e){
+    console.error("Google Drive upload failed",e);
+    return err("ወደ Google Drive መጫን አልተቻለም።",502);
+  }
+}
 async function fileResponse(request,env,kind){
   const url=new URL(request.url),type=kind==="preview"?"inline":"attachment";
   const entityKind=url.searchParams.get("kind"),id=url.searchParams.get("id"),raw=url.searchParams.get("file"),name=url.searchParams.get("name");
@@ -105,6 +123,11 @@ async function handler(request,env){
   const a=await auth(request,env),needsAuth=!["/api/auth/login","/api/auth/register-student"].includes(path);
   if(needsAuth&&a.error)return err(a.error,a.status);
   const actor=a.user;
+  if(path==="/api/files/upload"&&method==="POST"){
+    const fileName=safeName(body.fileName),mimeType=String(body.mimeType||"application/octet-stream").trim(),base64=String(body.base64||"").trim();
+    if(!fileName||!base64||!/^[A-Za-z0-9+/]*={0,2}$/.test(base64))return err("የፋይል መረጃው ትክክል አይደለም።",400);
+    return uploadToGoogleDrive(env,{fileName,mimeType,base64});
+  }
   const idMatch=path.match(/^\/api\/(users|resources|exams|reports|directives|dept-materials)\/(\d+)$/);
   // Departments
   if(path==="/api/departments"&&method==="GET"){const rows=(await all(env,"departments")).sort((x,y)=>String(x.createdAt).localeCompare(String(y.createdAt)));return json({departments:rows.map(d=>({...d,allowsMedia:Boolean(d.allowsMedia)}))});}
