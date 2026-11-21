@@ -21,6 +21,7 @@ function enhanceHtml(response) {
     .on('meta[property="og:site_name"]', {element(e) { e.setAttribute("content", SEO_TERMS[3]); }})
     .on('link[rel="canonical"]', {element(e) { e.setAttribute("href", "https://senbet.1surapro25.workers.dev/"); }})
     .on("head", {element(e) {
+      e.append('<meta property="og:image" content="https://senbet.1surapro25.workers.dev/og-image.png"><meta property="og:image:secure_url" content="https://senbet.1surapro25.workers.dev/og-image.png"><meta property="og:image:type" content="image/png"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:image" content="https://senbet.1surapro25.workers.dev/og-image.png">', {html:true});
       e.append('<script type="application/ld+json">'+JSON.stringify(SEO_SCHEMA)+'</script><script>'+SEARCH_ASSIST_SCRIPT+'</script>', {html:true});
     }})
     .transform(response);
