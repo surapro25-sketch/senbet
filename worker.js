@@ -69,15 +69,41 @@ function expirationTime(row){
   return null;
 }
 function isExpired(row,at=Date.now()){const expires=expirationTime(row);return expires!==null&&expires<=at;}
-async function trashGoogleDriveFile(env,row){
-  const value=String(row?.fileUrl||row?.pdfUrl||"");
-  if(!value.startsWith("gdrive:"))return;
-  const script=googleDriveScriptUrl(env);if(!script)return;
+function extractGoogleDriveFileId(row){
+  const direct=String(row?.googleDriveFileId||"").trim().replace(/^gdrive:/i,"");
+  if(direct)return direct;
+  const value=String(row?.fileUrl||row?.pdfUrl||"").trim();
+  if(!value)return "";
+  if(/^gdrive:/i.test(value))return value.slice(7).trim();
   try{
-    const target=new URL(script);target.searchParams.set("action","delete");target.searchParams.set("fileId",value.slice(7));
-    const response=await fetch(target.toString(),{method:"GET",redirect:"follow"});
-    if(!response.ok)console.error("Google Drive trash request failed",response.status,value.slice(7));
-  }catch(error){console.error("Google Drive trash request failed",error);}
+    const parsed=new URL(value);
+    const host=parsed.hostname.toLowerCase();
+    if(host==="drive.google.com"||host.endsWith(".drive.google.com")||host==="docs.google.com"){
+      const pathMatch=parsed.pathname.match(/\\/d\\/([A-Za-z0-9_-]{10,})/);
+      if(pathMatch)return pathMatch[1];
+      const queryId=parsed.searchParams.get("id");
+      if(queryId&&/^[A-Za-z0-9_-]{10,}$/.test(queryId))return queryId;
+    }
+  }catch{}
+  const match=value.match(/(?:^|[?&/])(?:id=|d/)?([A-Za-z0-9_-]{20,})(?:[/?&#]|$)/);
+  return match?match[1]:"";
+}
+async function trashGoogleDriveFile(env,row){
+  const fileId=extractGoogleDriveFileId(row);
+  if(!fileId)return true;
+  const script=googleDriveScriptUrl(env);
+  if(!script)throw new Error("GOOGLE_DRIVE_SCRIPT_URL is not configured; refusing to delete the KV record before its Drive file is trashed.");
+  const target=new URL(script);
+  target.searchParams.set("action","delete");
+  target.searchParams.set("fileId",fileId);
+  const response=await fetch(target.toString(),{method:"GET",redirect:"follow"});
+  const raw=await response.text();
+  let result=null;
+  try{result=raw?JSON.parse(raw):null;}catch{}
+  if(!response.ok||result?.error||result?.ok===false||result?.status==="error"){
+    throw new Error("Google Drive trash request failed ("+response.status+"): "+String(result?.error||result?.message||raw||"Unknown response").slice(0,300));
+  }
+  return true;
 }
 async function purgeExpiredTable(env,table){
   const rows=await all(env,table),expired=rows.filter(row=>isExpired(row));
@@ -268,7 +294,9 @@ async function handler(request,env){
     const id=await nextId(env,"resources"),r={id,title:String(body.title).trim(),description:String(body.description||"").trim(),resourceType:file.resourceType,fileUrl:file.fileUrl,fileName:file.fileName,targetGrade:grade,targetDivision:div,uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"resources",r);return json({resource:{...r,uploaderName:actor.fullName,uploaderRole:actor.role}},201);
   }
   if(idMatch&&idMatch[1]==="resources"&&method==="DELETE"){
-    const id=Number(idMatch[2]),r=await get(env,"resources",id);if(!r)return err("ግብአቱ አልተገኘም።",404);if(actor.role!=="head"&&r.uploadedBy!==actor.id)return err("ይህን ግብአት ለመሰረዝ ፈቃድ የለዎትም።",403);await remove(env,"resources",id);return json({ok:true});
+    const id=Number(idMatch[2]),r=await get(env,"resources",id);if(!r)return err("ግብአቱ አልተገኘም።",404);if(actor.role!=="head"&&r.uploadedBy!==actor.id)return err("ይህን ግብአት ለመሰረዝ ፈቃድ የለዎትም።",403);
+    try{await trashGoogleDriveFile(env,r);}catch(error){console.error("Resource Google Drive trash failed",error);return err("Google Drive ፋይሉን ወደ Trash ማንቀሳቀስ አልተቻለም፤ መዝገቡ አልተሰረዘም።",502);}
+    await remove(env,"resources",id);return json({ok:true});
   }
   // Exams
   if(path==="/api/exams"&&method==="GET"){
@@ -319,6 +347,11 @@ async function handler(request,env){
     const id=await nextId(env,"reports"),r={id,department:actor.department,submittedBy:actor.id,title:String(body.title).trim(),content:String(body.content).trim(),pdfUrl,pdfName,status:"pending",createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"reports",r);return json({report:{...r,submitterName:actor.fullName}},201);
   }
   if(idMatch&&idMatch[1]==="reports"&&method==="PATCH"){if(actor.role!=="head")return err("ፈቃድ የለዎትም።",403);const r=await get(env,"reports",Number(idMatch[2]));if(r){r.status=body.status==="reviewed"?"reviewed":"pending";await put(env,"reports",r);}return json({ok:true});}
+  if(idMatch&&idMatch[1]==="reports"&&method==="DELETE"){
+    const id=Number(idMatch[2]),r=await get(env,"reports",id);if(!r)return err("ሪፖርቱ አልተገኘም።",404);if(actor.role!=="head"&&!(actor.role==="dept_head"&&r.submittedBy===actor.id))return err("ይህን ሪፖርት ለመሰረዝ ፈቃድ የለዎትም።",403);
+    try{await trashGoogleDriveFile(env,r);}catch(error){console.error("Report Google Drive trash failed",error);return err("Google Drive ፋይሉን ወደ Trash ማንቀሳቀስ አልተቻለም፤ መዝገቡ አልተሰረዘም።",502);}
+    await remove(env,"reports",id);return json({ok:true});
+  }
   // Directives
   if(path==="/api/directives"&&method==="GET"){
     let rows=await enriched(env,await all(env,"directives"),"senderId",u=>({senderName:u.fullName,senderRole:u.role}));if(actor.role==="head"){}else if(actor.role==="dept_head"&&actor.department)rows=rows.filter(d=>d.targetDepartment===actor.department);else if(actor.role==="dept_member"&&actor.department)rows=rows.filter(d=>d.targetDepartment===actor.department&&d.targetScope==="dept_members");else rows=[];rows.sort(sortNewest);return json({directives:rows});
@@ -344,7 +377,9 @@ async function handler(request,env){
     const id=await nextId(env,"materials"),m={id,department:actor.department,title:String(body.title).trim(),description:String(body.description||"").trim(),fileType:f.resourceType,fileUrl:f.fileUrl,fileName:f.fileName,uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"materials",m);return json({material:{...m,uploaderName:actor.fullName}},201);
   }
   if(idMatch&&idMatch[1]==="dept-materials"&&method==="DELETE"){
-    const id=Number(idMatch[2]),m=await get(env,"materials",id);if(!m)return err("ፋይሉ አልተገኘም።",404);if(actor.role!=="head"&&m.uploadedBy!==actor.id)return err("ፈቃድ የለዎትም።",403);await remove(env,"materials",id);return json({ok:true});
+    const id=Number(idMatch[2]),m=await get(env,"materials",id);if(!m)return err("ፋይሉ አልተገኘም።",404);if(actor.role!=="head"&&m.uploadedBy!==actor.id)return err("ፈቃድ የለዎትም።",403);
+    try{await trashGoogleDriveFile(env,m);}catch(error){console.error("Material Google Drive trash failed",error);return err("Google Drive ፋይሉን ወደ Trash ማንቀሳቀስ አልተቻለም፤ መዝገቡ አልተሰረዘም።",502);}
+    await remove(env,"materials",id);return json({ok:true});
   }
   // Targeted messages
   if(path==="/api/messages"&&method==="GET"){
