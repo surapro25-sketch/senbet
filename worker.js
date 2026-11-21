@@ -265,7 +265,20 @@ async function handler(request,env){
   if(path==="/api/messages"&&method==="GET"){
     const users=await all(env,"users"),rows=await all(env,"messages");let enrichedRows=rows.map(m=>{const u=users.find(x=>x.id===m.senderId);return {...m,senderName:u?.fullName||"",senderRole:u?.role||"",senderDepartment:u?.department||null};}).sort(sortNewest);
     const can=actor.role==="head"||(["dept_head","dept_member"].includes(actor.role)&&actor.department==="member_admin");
-    if(!can)enrichedRows=enrichedRows.filter(m=>m.targetType==="all"||(actor.role==="student"&&actor.assignedGrade&&((m.targetType==="grade"&&Number(m.targetValue)===actor.assignedGrade)||(m.targetType==="division"&&m.targetValue===division(actor.assignedGrade))))||(actor.role==="teacher"&&(m.targetType==="teachers"||(actor.assignedGrade&&((m.targetType==="grade"&&Number(m.targetValue)===actor.assignedGrade)||(m.targetType==="division"&&m.targetValue===division(actor.assignedGrade)))))||(["dept_head","dept_member"].includes(actor.role)&&actor.department&&m.targetType==="department"&&m.targetValue===actor.department));
+    if(!can)enrichedRows=enrichedRows.filter(m=>{
+      if(m.targetType==="all")return true;
+      if(actor.role==="student"&&actor.assignedGrade){
+        if(m.targetType==="grade"&&Number(m.targetValue)===actor.assignedGrade)return true;
+        if(m.targetType==="division"&&m.targetValue===division(actor.assignedGrade))return true;
+      }
+      if(actor.role==="teacher"){
+        if(m.targetType==="teachers")return true;
+        if(actor.assignedGrade&&m.targetType==="grade"&&Number(m.targetValue)===actor.assignedGrade)return true;
+        if(actor.assignedGrade&&m.targetType==="division"&&m.targetValue===division(actor.assignedGrade))return true;
+      }
+      if(["dept_head","dept_member"].includes(actor.role)&&actor.department&&m.targetType==="department"&&m.targetValue===actor.department)return true;
+      return false;
+    });
     return json({messages:enrichedRows});
   }
   if(path==="/api/messages"&&method==="POST"){
