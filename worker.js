@@ -1,5 +1,281 @@
-// 8. Serve React frontend
-    if (env.ASSETS) {
-      return env.ASSETS.fetch(request);
-    }
-    return new Response("Frontend assets not bound. Deploy via Git/Wrangler.", { status: 500 });
+/**
+ * SENBET Cloudflare Worker API + Static Assets
+ * Data is stored as JSON records in the SENBET_DB KV namespace.
+ * Existing API response envelopes and role checks are retained.
+ */
+const TABLES = ["users","sessions","departments","resources","exams","attendance","reports","directives","materials","messages"];
+const json = (data, status=200, headers={}) => new Response(JSON.stringify(data), {status,headers:{"content-type":"application/json; charset=utf-8",...headers}});
+const err = (error,status=400) => json({error},status);
+const now = () => new Date().toISOString().replace("T"," ").slice(0,19);
+const idKey = (table,id) => table+":"+id;
+async function all(env, table) {
+  const {keys=[]}=await env.SENBET_DB.list({prefix:table+":"});
+  const rows=await Promise.all(keys.map(async k=>{try{return JSON.parse(await env.SENBET_DB.get(k.name));}catch{return null;}}));
+  return rows.filter(Boolean);
+}
+async function get(env,table,id) { const s=await env.SENBET_DB.get(idKey(table,id)); try{return s?JSON.parse(s):null;}catch{return null;} }
+async function put(env,table,row) { await env.SENBET_DB.put(idKey(table,row.id),JSON.stringify(row)); return row; }
+async function remove(env,table,id) { await env.SENBET_DB.delete(idKey(table,id)); }
+async function nextId(env,table) {
+  const key="seq:"+table, n=Number(await env.SENBET_DB.get(key)||0)+1;
+  await env.SENBET_DB.put(key,String(n)); return n;
+}
+const sortNewest=(a,b)=>String(b.createdAt||"").localeCompare(String(a.createdAt||""))||Number(b.id)-Number(a.id);
+const sortName=(a,b)=>String(a.fullName||"").localeCompare(String(b.fullName||""));
+const safeUser=(u,withPassword=false)=>{if(!u)return null;const {password,passwordHash,...rest}=u;return withPassword?{...rest}:rest;};
+function division(grade){return grade>=1&&grade<=4?"wetani":grade<=6?"maekelawi":"wetat";}
+function gradeByAge(age){return age<=10?1:age<=14?3:age<=17?5:7;}
+function mimeFor(name){const e=(name.split(".").pop()||"").toLowerCase();return ({pdf:"application/pdf",mp3:"audio/mpeg",wav:"audio/wav",ogg:"audio/ogg",m4a:"audio/mp4",aac:"audio/mp4",mp4:"video/mp4",webm:"video/webm",mov:"video/quicktime",avi:"video/x-msvideo",mkv:"video/x-matroska"})[e]||"application/octet-stream";}
+function resourceType(name,mime,explicit){const n=(name||"").toLowerCase(),m=(mime||"").toLowerCase();if(m==="application/pdf"||n.endsWith(".pdf"))return "pdf";if(m.startsWith("audio/")||/\.(mp3|wav|ogg|m4a|aac)$/.test(n))return "audio";if(m.startsWith("video/")||/\.(mp4|webm|mov|mkv|avi)$/.test(n))return "video";return ["pdf","audio","video"].includes(explicit)?explicit:null;}
+function safeName(s){return String(s||"file").split(/[\\/]/).pop().replace(/[\r\n"]/g,"_");}
+function disposition(type,name){const n=safeName(name||"download");const ascii=n.replace(/[^\x20-\x7e]/g,"_").replace(/"/g,"'");return type+'; filename="'+ascii+'"; filename*=UTF-8\'\''+encodeURIComponent(n);}
+async function readBody(req){const ct=req.headers.get("content-type")||"";if(ct.includes("application/json"))return await req.json().catch(()=>({}));if(ct.includes("multipart/form-data")){const f=await req.formData(),o={};for(const [k,v] of f.entries()){if(typeof v==="string")o[k]=v;else if(v&&v.name){o.file=v;o.originalFileName=v.name;o.mimeType=v.type;}}return o;}return {};}
+async function ensureSeed(env){
+  if(await env.SENBET_DB.get("meta:initialized"))return;
+  const depts=[
+    ["education","ትምህርት ክፍል","የትምህርት ካሪኩለም፣ የመጽሐፍ ቅዱስና የቤተ ክርስቲያን ታሪክ ትምህርቶች አስተባባሪ",false],
+    ["choir","መዝሙር ክፍል","የመዝሙር ልምምድ፣ የበገናና የከበሮ አገልግሎት (PDF፣ ኦዲዮ እና ቪዲዮ ግብአቶች)",true],
+    ["property","ንብረት ክፍል","የሰንበት ትምህርት ቤቱ ንብረቶች፣ መጻሕፍትና ቁሳቁስ አስተዳደር",false],
+    ["charity","በጎ አድራጎት ክፍል","የድጋፍ፣ የጉብኝት እና የበጎ አድራጎት አገልግሎት ማስተባበሪያ",false],
+    ["member_admin","አባላት አስተዳደር ክፍል","የአባላት መረጃ፣ ስነ-ምግባርና ለሁሉም ክፍሎች መልእክት ማስተላለፊያ",false]
+  ];
+  for(const [id,label,description,allowsMedia] of depts) await put(env,"departments",{id,label,description,allowsMedia,createdAt:now()});
+  const salt=crypto.getRandomValues(new Uint8Array(16));
+  const hash=await hashPassword("admin123",salt);
+  await put(env,"users",{id:1,username:"admin",passwordHash:hash,passwordSalt:Array.from(salt),fullName:"SENBET Administrator",role:"head",age:32,educationLevel:"ዲግሪ",assignedGrade:null,department:null,subject:null,phone:null,createdAt:now()});
+  await env.SENBET_DB.put("seq:users","1");
+  await env.SENBET_DB.put("meta:initialized","1");
+}
+async function hashPassword(password,saltBytes){const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveBits"]);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt:saltBytes,iterations:120000,hash:"SHA-256"},key,256);return Array.from(new Uint8Array(bits)).map(x=>x.toString(16).padStart(2,"0")).join("");}
+async function verifyPassword(user,password){if(user.passwordHash&&user.passwordSalt){return await hashPassword(password,new Uint8Array(user.passwordSalt))===user.passwordHash;}return user.password===password;}
+async function makeToken(env,userId){const token=Array.from(crypto.getRandomValues(new Uint8Array(24))).map(x=>x.toString(16).padStart(2,"0")).join("");await put(env,"sessions",{id:token,token,userId,createdAt:now()});return token;}
+async function auth(req,env){const token=(req.headers.get("authorization")||"").startsWith("Bearer ")?req.headers.get("authorization").slice(7).trim():"";if(!token)return {error:"እባክዎ መጀመሪያ ወደ ስርዓቱ ይግቡ።",status:401};const s=await get(env,"sessions",token);const u=s?await get(env,"users",s.userId):null;if(!u)return {error:"የመግቢያ ጊዜዎ አብቅቷል፤ እባክዎ እንደገና ይግቡ።",status:401};return {user:u,token};}
+const joinedUser=(row,u,fields={})=>({...row,...fields});
+async function withUser(env,row,field){const u=await get(env,"users",row[field]);return u?{...row,[field==="uploadedBy"?"uploaderName":field==="submittedBy"?"submitterName":"senderName"]:u.fullName,...(field==="uploadedBy"?{uploaderRole:u.role}:{})}:row;}
+async function enriched(env,rows,foreign,extra){const out=[];for(const r of rows){const u=await get(env,"users",r[foreign]);out.push({...r,...(u?extra(u):{})});}return out;}
+async function getFile(env,kind,id){const table=kind==="resource"?"resources":kind==="material"?"materials":kind==="report"?"reports":null;const row=table?await get(env,table,Number(id)):null;if(!row)return null;return kind==="report"?{fileUrl:row.pdfUrl,fileName:row.pdfName||"report.pdf"}:{fileUrl:row.fileUrl,fileName:row.fileName};}
+async function fileResponse(request,env,kind){
+  const url=new URL(request.url),type=kind==="preview"?"inline":"attachment";
+  const entityKind=url.searchParams.get("kind"),id=url.searchParams.get("id"),raw=url.searchParams.get("file"),name=url.searchParams.get("name");
+  let target=null,filename=name||"download";
+  if(entityKind&&id){target=await getFile(env,entityKind,id);if(!target)return err("ፋይሉ አልተገኘም።",404);filename=target.fileName||filename;}
+  else if(raw){target={fileUrl:"/uploads/"+safeName(raw),fileName:safeName(raw)};filename=name||target.fileName;}
+  else return err("የፋይል መለያ አልተሰጠም።",400);
+  const value=target.fileUrl||"";
+  if(value.startsWith("gdrive:")){
+    const script=(env.GOOGLE_DRIVE_SCRIPT_URL||"").trim(),fid=value.slice(7);
+    try{
+      let upstream;
+      if(script){const sep=script.includes("?")?"&":"?";upstream=await fetch(script+sep+"fileId="+encodeURIComponent(fid),{redirect:"follow"});}
+      if(!upstream||!upstream.ok||(upstream.headers.get("content-type")||"").includes("text/html"))upstream=await fetch("https://drive.google.com/uc?export=download&confirm=t&id="+encodeURIComponent(fid),{redirect:"follow"});
+      if(!upstream.ok)return err("ፋይሉን ከGoogle Drive ማውረድ አልተቻለም።",502);
+      const ct=upstream.headers.get("content-type")||mimeFor(filename);
+      if(ct.includes("application/json")){const p=await upstream.json();if(p.error||p.status==="error")return err(p.error||p.message||"Google Drive error",502);const b64=p.base64||p.data;if(b64){const bin=atob(String(b64).split(",").pop());const bytes=Uint8Array.from(bin,c=>c.charCodeAt(0));return new Response(bytes,{headers:{"content-type":p.mimeType||p.contentType||mimeFor(filename),"content-disposition":disposition(type,filename),"cache-control":"private, max-age=3600"}});}const dest=p.downloadUrl||p.url;if(dest){const r=await fetch(dest);return new Response(r.body,{status:r.status,headers:{"content-type":mimeFor(filename),"content-disposition":disposition(type,filename),"cache-control":"private, max-age=3600"}});}}
+      return new Response(upstream.body,{status:200,headers:{"content-type":ct,"content-disposition":disposition(type,filename),"cache-control":"private, max-age=3600",...(upstream.headers.get("content-length")?{"content-length":upstream.headers.get("content-length")}:{})}});
+    }catch{return err("ፋይሉን ከGoogle Drive ማውረድ አልተቻለም።",502);}
+  }
+  if(value.startsWith("/uploads/"))return err("ይህ ፋይል በአሮጌው የአገልጋይ ዲስክ ላይ ነበር፤ ወደ Google Drive እንደገና ይጫኑት።",404);
+  return err("የፋይሉ አድራሻ ትክክል አይደለም።",400);
+}
+async function createStoredFile(body,field="file"){
+  const name=safeName(body.originalFileName||body.file?.name||"");
+  const mime=body.mimeType||body.file?.type||mimeFor(name);
+  const drive=String(body.googleDriveFileId||"").trim();
+  if(!name||!drive||/\s/.test(drive))return null;
+  return {fileUrl:"gdrive:"+drive,fileName:name,resourceType:resourceType(name,mime,body.resourceType||body.fileType)};
+}
+async function handler(request,env){
+  await ensureSeed(env);
+  const url=new URL(request.url),path=url.pathname,method=request.method;
+  if(path==="/api/files/download"&&method==="GET")return fileResponse(request,env,"download");
+  if(path==="/api/files/preview"&&method==="GET")return fileResponse(request,env,"preview");
+  if(path==="/api/public/overview"&&method==="GET"){
+    const users=await all(env,"users"),resources=await all(env,"resources");
+    return json({stats:{studentCount:users.filter(x=>x.role==="student").length,teacherCount:users.filter(x=>x.role==="teacher").length,resourceCount:resources.length,memberCount:users.filter(x=>["dept_head","dept_member"].includes(x.role)).length}});
+  }
+  const body=["POST","PATCH","PUT"].includes(method)?await readBody(request):{};
+  const a=await auth(request,env),needsAuth=!["/api/auth/login","/api/auth/register-student"].includes(path);
+  if(needsAuth&&a.error)return err(a.error,a.status);
+  const actor=a.user;
+  const idMatch=path.match(/^\/api\/(users|resources|exams|reports|directives|dept-materials)\/(\d+)$/);
+  // Departments
+  if(path==="/api/departments"&&method==="GET"){const rows=(await all(env,"departments")).sort((x,y)=>String(x.createdAt).localeCompare(String(y.createdAt)));return json({departments:rows.map(d=>({...d,allowsMedia:Boolean(d.allowsMedia)}))});}
+  if(path==="/api/departments"&&method==="POST"){
+    if(actor.role!=="head")return err("አዲስ የስራ ክፍል ለመፍጠር የሀላፊ ፈቃድ ያስፈልጋል።",403);
+    const label=typeof body.label==="string"?body.label.trim():"";if(!label)return err("እባክዎ የአዲሱን የስራ ክፍል ስም ያስገቡ።");
+    const rows=await all(env,"departments"),old=rows.find(d=>d.label.toLowerCase()===label.toLowerCase());if(old)return json({department:{...old,allowsMedia:Boolean(old.allowsMedia)}});
+    const d={id:"dept_"+Date.now().toString(36)+"_"+crypto.randomUUID().slice(0,4),label,description:String(body.description||"").trim(),allowsMedia:Boolean(body.allowsMedia),createdAt:now()};await put(env,"departments",d);return json({department:d},201);
+  }
+  // Admin stats
+  if(path==="/api/admin/stats"&&method==="GET"){
+    if(actor.role!=="head")return err("የአስተዳደር ስታቲስቲክስን ለማየት የሀላፊ ፈቃድ ያስፈልጋል።",403);
+    const users=await all(env,"users"),resources=await all(env,"resources"),reports=await all(env,"reports"),atts=await all(env,"attendance");
+    const students=users.filter(u=>u.role==="student"),studentsPerGrade=Array.from({length:12},(_,i)=>{const g=i+1;return {grade:g,label:g+"ኛ ክፍል",division:division(g),count:students.filter(s=>s.assignedGrade===g).length};});
+    const divisionTotals=[["wetani","ወጣኒ (1ኛ - 4ኛ)"],["maekelawi","ማእከላዊ (5ኛ - 6ኛ)"],["wetat","ወጣት (7ኛ - 12ኛ)"]].map(([d,label])=>({division:d,label,count:studentsPerGrade.filter(x=>x.division===d).reduce((n,x)=>n+x.count,0)}));
+    const dates=[...new Set(atts.map(x=>x.date))].sort().slice(0,30),attendanceTrends=dates.map(date=>{const rows=atts.filter(x=>x.date===date),present=rows.filter(x=>x.status==="present").length,absent=rows.filter(x=>x.status==="absent").length,late=rows.filter(x=>x.status==="late").length,excused=rows.filter(x=>x.status==="excused").length,total=rows.length;return {date,present,absent,late,excused,total,rate:total?Math.round((present+late)/total*100):0};});
+    const total=atts.length,attended=atts.filter(x=>["present","late"].includes(x.status)).length;
+    return json({summary:{totalStudents:students.length,totalTeachers:users.filter(x=>x.role==="teacher").length,totalDeptMembers:users.filter(x=>["dept_head","dept_member"].includes(x.role)).length,attendanceRate:total?Math.round(attended/total*100):0,pendingReports:reports.filter(x=>x.status==="pending").length,totalResources:resources.length},studentsPerGrade,divisionTotals,attendanceTrends});
+  }
+  // Auth
+  if(path==="/api/auth/register-student"&&method==="POST"){
+    const fullName=String(body.fullName||"").trim(),age=Number(body.age),username=String(body.username||"").trim(),password=String(body.password||"");
+    if(fullName.split(/\s+/).length<3)return err("እባክዎ ሙሉ ስምዎን እስከ አያት (3 ስሞች) ያስገቡ።");
+    if(!Number.isInteger(age)||age<5||age>100)return err("እድሜ ከ5 ዓመት በላይ ትክክለኛ ቁጥር መሆን አለበት።");
+    if(!String(body.educationLevel||"").trim())return err("እባክዎ አሁን ያሉበትን የትምህርት ደረጃ ያስገቡ።");
+    if(username.length<3)return err("የመግቢያ ስም (Username) ቢያንስ 3 ፊደላት መሆን አለበት።");
+    if(password.length<4)return err("የይለፍ ቃል (Password) ቢያንስ 4 ቁምፊ መሆን አለበት።");
+    if((await all(env,"users")).some(u=>u.username===username))return err("ይህ የመግቢያ ስም (Username) አስቀድሞ ተይዟል፤ ሌላ ይምረጡ።",409);
+    const id=await nextId(env,"users"),salt=crypto.getRandomValues(new Uint8Array(16)),user={id,username,passwordHash:await hashPassword(password,salt),passwordSalt:Array.from(salt),fullName,role:"student",age,educationLevel:String(body.educationLevel).trim(),assignedGrade:gradeByAge(age),department:null,subject:null,phone:body.phone?String(body.phone).trim():null,createdAt:now()};
+    await put(env,"users",user);const token=await makeToken(env,id);return json({token,user:safeUser(user)},201);
+  }
+  if(path==="/api/auth/login"&&method==="POST"){
+    if(!body.username||!body.password)return err("እባክዎ የመግቢያ ስም እና የይለፍ ቃል ያስገቡ።");
+    const u=(await all(env,"users")).find(x=>x.username===String(body.username).trim());
+    if(!u||!(await verifyPassword(u,String(body.password))))return err("የመግቢያ ስም ወይም የይለፍ ቃል ትክክል አይደለም።",401);
+    return json({token:await makeToken(env,u.id),user:safeUser(u)});
+  }
+  if(path==="/api/auth/logout"&&method==="POST"){await remove(env,"sessions",a.token);return json({ok:true});}
+  if(path==="/api/auth/me"&&method==="GET")return json({user:safeUser(actor)});
+  // User management
+  if(path==="/api/users"&&method==="GET"){
+    const users=await all(env,"users");
+    if(actor.role==="head")return json({users:users.sort((x,y)=>String(x.role).localeCompare(String(y.role))||(x.assignedGrade||0)-(y.assignedGrade||0)||y.id-x.id).map(u=>safeUser(u))});
+    if(actor.role==="teacher")return json({users:actor.assignedGrade?users.filter(u=>u.role==="student"&&u.assignedGrade===actor.assignedGrade).sort(sortName).map(u=>safeUser(u)):[]});
+    if(actor.role==="dept_head")return json({users:actor.department?users.filter(u=>u.department===actor.department&&["dept_head","dept_member"].includes(u.role)).sort((x,y)=>String(x.role).localeCompare(String(y.role))||sortName(x,y)).map(u=>safeUser(u)):[]});
+    return err("ይህን መረጃ ለማየት ፈቃድ የለዎትም።",403);
+  }
+  if(path==="/api/users"&&method==="POST"){
+    if(!body.username||!body.password||!body.fullName)return err("ሙሉ ስም፣ የመግቢያ ስም እና የይለፍ ቃል ያስፈልጋሉ።");
+    const users=await all(env,"users");if(users.some(u=>u.username===String(body.username).trim()))return err("ይህ የመግቢያ ስም (Username) አስቀድሞ አለ።",409);
+    let role,dept=body.department||null,grade=body.assignedGrade?Number(body.assignedGrade):null;
+    if(actor.role==="head"){if(!["head","teacher","student","dept_head","dept_member"].includes(body.role))return err("ትክክለኛ የስራ ድርሻ (Role) ይምረጡ።");role=body.role;if(role==="student"&&!grade&&body.age)grade=gradeByAge(Number(body.age));}
+    else if(actor.role==="dept_head"&&actor.department){role="dept_member";dept=actor.department;grade=null;}
+    else return err("አዲስ አባል ወይም መምህር ለመመዝገብ ፈቃድ የለዎትም።",403);
+    const salt=crypto.getRandomValues(new Uint8Array(16)),id=await nextId(env,"users"),u={id,username:String(body.username).trim(),passwordHash:await hashPassword(String(body.password),salt),passwordSalt:Array.from(salt),fullName:String(body.fullName).trim(),role,age:body.age?Number(body.age):null,educationLevel:body.educationLevel?String(body.educationLevel).trim():null,assignedGrade:grade,department:dept,subject:role==="teacher"&&body.subject?String(body.subject).trim():null,phone:body.phone?String(body.phone).trim():null,createdAt:now()};await put(env,"users",u);return json({user:safeUser(u)},201);
+  }
+  if(idMatch&&idMatch[1]==="users"&&method==="PATCH"){
+    const targetId=Number(idMatch[2]),u=await get(env,"users",targetId);if(!u)return err("ተጠቃሚው አልተገኘም።",404);
+    if(actor.role!=="head"&&actor.id!==targetId)return err("የሌላ ተጠቃሚ መረጃ ለማስተካከል ፈቃድ የለዎትም።",403);
+    const users=await all(env,"users");if(body.username&&body.username.trim()!==u.username&&users.some(x=>x.id!==targetId&&x.username===String(body.username).trim()))return err("ይህ የመግቢያ ስም (Username) በሌላ ሰው ተይዟል።",409);
+    if(actor.role==="head"){
+      for(const k of ["fullName","username","age","educationLevel","assignedGrade","department","role","phone"])if(body[k]!==undefined)u[k]=["fullName","username","educationLevel","department","phone"].includes(k)?(body[k]?String(body[k]).trim():null):(["age","assignedGrade"].includes(k)?(body[k]===""||body[k]===null?null:Number(body[k])):body[k]);
+      if(u.role==="teacher"&&body.subject!==undefined)u.subject=body.subject?String(body.subject).trim():null;else if(u.role!=="teacher")u.subject=null;
+    }else{for(const k of ["fullName","educationLevel","phone"])if(body[k]!==undefined)u[k]=body[k]?String(body[k]).trim():null;}
+    if(body.password) {const salt=crypto.getRandomValues(new Uint8Array(16));u.passwordHash=await hashPassword(String(body.password),salt);u.passwordSalt=Array.from(salt);delete u.password;}
+    await put(env,"users",u);return json({user:safeUser(u)});
+  }
+  if(idMatch&&idMatch[1]==="users"&&method==="DELETE"){
+    const targetId=Number(idMatch[2]);if(actor.role!=="head")return err("መለያ ለመሰረዝ የሀላፊ ፈቃድ ያስፈልጋል።",403);if(actor.id===targetId)return err("የራስዎን ዋና ሀላፊ መለያ መሰረዝ አይችሉም።");await remove(env,"users",targetId);for(const s of await all(env,"sessions"))if(s.userId===targetId)await remove(env,"sessions",s.token);return json({ok:true});
+  }
+  if(path==="/api/files/upload-config"&&method==="GET"){
+    if(!["head","teacher","dept_head"].includes(actor.role))return json({enabled:false,scriptUrl:null});const script=(env.GOOGLE_DRIVE_SCRIPT_URL||"").trim();return json({enabled:!!script,scriptUrl:script||null});
+  }
+  // Educational resources
+  if(path==="/api/resources"&&method==="GET"){
+    let rows=await enriched(env,await all(env,"resources"),"uploadedBy",u=>({uploaderName:u.fullName,uploaderRole:u.role}));rows.sort(sortNewest);
+    if(actor.role==="student"&&actor.assignedGrade){const d=division(actor.assignedGrade);rows=rows.filter(r=>(r.targetGrade==null&&["all",d].includes(r.targetDivision))||r.targetGrade===actor.assignedGrade).map(r=>({...r,fileUrl:"/api/files/download?kind=resource&id="+r.id}));}
+    return json({resources:rows});
+  }
+  if(path==="/api/resources"&&method==="POST"){
+    if(!["head","teacher","dept_head"].includes(actor.role))return err("የትምህርት ግብአት ለመጫን ፈቃድ የለዎትም።",403);
+    if(!String(body.title||"").trim())return err("እባክዎ የትምህርት ግብአቱን ርዕስ ያስገቡ።");
+    const file=await createStoredFile(body);if(!file)return err("እባክዎ ፋይል (PDF፣ Audio ወይም Video) ይምረጡ።");
+    if(!file.resourceType)return err("የተፈቀዱት የፋይል አይነቶች PDF፣ Audio እና Video ብቻ ናቸው።");
+    let grade=body.targetGrade?Number(body.targetGrade):null,div=body.targetDivision||"all";if(actor.role==="teacher"&&actor.assignedGrade&&!grade&&div==="all")grade=actor.assignedGrade;if(grade)div=division(grade);
+    const id=await nextId(env,"resources"),r={id,title:String(body.title).trim(),description:String(body.description||"").trim(),resourceType:file.resourceType,fileUrl:file.fileUrl,fileName:file.fileName,targetGrade:grade,targetDivision:div,uploadedBy:actor.id,createdAt:now()};await put(env,"resources",r);return json({resource:{...r,uploaderName:actor.fullName,uploaderRole:actor.role}},201);
+  }
+  if(idMatch&&idMatch[1]==="resources"&&method==="DELETE"){
+    const id=Number(idMatch[2]),r=await get(env,"resources",id);if(!r)return err("ግብአቱ አልተገኘም።",404);if(actor.role!=="head"&&r.uploadedBy!==actor.id)return err("ይህን ግብአት ለመሰረዝ ፈቃድ የለዎትም።",403);await remove(env,"resources",id);return json({ok:true});
+  }
+  // Exams
+  if(path==="/api/exams"&&method==="GET"){
+    const grade=url.searchParams.get("grade"),users=await all(env,"users");let rows=await all(env,"exams");
+    if(actor.role==="head"){if(grade)rows=rows.filter(e=>e.grade===Number(grade));}
+    else if(actor.role==="teacher")rows=actor.assignedGrade?rows.filter(e=>e.grade===actor.assignedGrade):[];
+    else if(actor.role==="student")rows=rows.filter(e=>e.studentId===actor.id);else rows=[];
+    rows=rows.map(e=>({...e,studentName:users.find(u=>u.id===e.studentId)?.fullName||"",recordedByName:users.find(u=>u.id===e.recordedBy)?.fullName||""}));
+    rows.sort((x,y)=>actor.role==="teacher"||actor.role==="head"?(x.grade-y.grade)||String(x.studentName).localeCompare(y.studentName)||y.id-x.id:y.id-x.id);return json({exams:rows});
+  }
+  if(path==="/api/exams"&&method==="POST"){
+    if(!["head","teacher"].includes(actor.role))return err("የፈተና ውጤት ለመመዝገብ ፈቃድ የለዎትም።",403);
+    const student=await get(env,"users",Number(body.studentId));if(!student||student.role!=="student"||!student.assignedGrade)return err("ተማሪው አልተገኘም።",404);
+    if(actor.role==="teacher"&&actor.assignedGrade!==student.assignedGrade)return err("እርስዎ ከተመደቡበት ክፍል ውጪ ላሉ ተማሪዎች ውጤት ማስገባት አይችሉም።",403);
+    const score=Number(body.score),max=Number(body.maxScore||100);if(Number.isNaN(score)||score<0||score>max)return err("ውጤቱ ከ0 እስከ "+max+" መካከል መሆን አለበት።");
+    const id=await nextId(env,"exams"),e={id,studentId:student.id,grade:student.assignedGrade,subject:String(body.subject||"አጠቃላይ ትምህርት").trim(),examTitle:String(body.examTitle||"ፈተና").trim(),score,maxScore:max,term:String(body.term||"1ኛ መንፈቅ ዓመት").trim(),remarks:String(body.remarks||"").trim(),recordedBy:actor.id,updatedAt:now()};await put(env,"exams",e);return json({exam:{...e,studentName:student.fullName,recordedByName:actor.fullName}},201);
+  }
+  if(idMatch&&idMatch[1]==="exams"&&method==="PATCH"){
+    const id=Number(idMatch[2]),e=await get(env,"exams",id);if(!e)return err("የፈተና ውጤቱ አልተገኘም።",404);if(actor.role!=="head"&&!(actor.role==="teacher"&&actor.assignedGrade===e.grade))return err("ይህን ውጤት ለማስተካከል ፈቃድ የለዎትም።",403);
+    const max=body.maxScore!==undefined?Number(body.maxScore):e.maxScore,score=body.score!==undefined?Number(body.score):e.score;if(Number.isNaN(score)||score<0||score>max)return err("ውጤቱ ከ0 እስከ "+max+" መካከል መሆን አለበት።");
+    for(const k of ["subject","examTitle","term","remarks"])if(body[k]!==undefined)e[k]=String(body[k]).trim();e.score=score;e.maxScore=max;e.updatedAt=now();await put(env,"exams",e);const users=await all(env,"users");return json({exam:{...e,studentName:users.find(u=>u.id===e.studentId)?.fullName||"",recordedByName:users.find(u=>u.id===e.recordedBy)?.fullName||""}});
+  }
+  if(idMatch&&idMatch[1]==="exams"&&method==="DELETE"){
+    const id=Number(idMatch[2]),e=await get(env,"exams",id);if(!e)return err("የፈተና ውጤቱ አልተገኘም።",404);if(actor.role!=="head"&&!(actor.role==="teacher"&&actor.assignedGrade===e.grade))return err("ፈቃድ የለዎትም።",403);await remove(env,"exams",id);return json({ok:true});
+  }
+  // Attendance
+  if(path==="/api/attendance"&&method==="GET"){
+    const date=url.searchParams.get("date"),grade=url.searchParams.get("grade"),users=await all(env,"users");let rows=await all(env,"attendance");
+    if(actor.role==="head"){if(grade)rows=rows.filter(x=>x.grade===Number(grade));if(date)rows=rows.filter(x=>x.date===date);}
+    else if(actor.role==="teacher")rows=actor.assignedGrade?rows.filter(x=>x.grade===actor.assignedGrade&&(!date||x.date===date)):[];
+    else if(actor.role==="student")rows=rows.filter(x=>x.studentId===actor.id);else rows=[];
+    rows=rows.map(x=>({...x,studentName:users.find(u=>u.id===x.studentId)?.fullName||"",recordedByName:users.find(u=>u.id===x.recordedBy)?.fullName||""}));rows.sort((x,y)=>String(y.date).localeCompare(String(x.date))||(x.grade-y.grade)||String(x.studentName).localeCompare(y.studentName));return json({attendance:rows});
+  }
+  if(path==="/api/attendance/bulk"&&method==="POST"){
+    if(!["head","teacher"].includes(actor.role))return err("አቴንዳንስ ለመመዝገብ ፈቃድ የለዎትም።",403);
+    if(!body.date||!Array.isArray(body.entries)||!body.entries.length)return err("እባክዎ ቀንና የተማሪዎችን አቴንዳንስ ያስገቡ።");
+    const users=await all(env,"users");for(const item of body.entries){const s=users.find(u=>u.id===Number(item.studentId)&&u.role==="student");if(!s||!s.assignedGrade)continue;if(actor.role==="teacher"&&actor.assignedGrade!==s.assignedGrade)return err("ከተመደቡበት ክፍል ውጪ አቴንዳንስ መመዝገብ አይችሉም።",403);let old=(await all(env,"attendance")).find(x=>x.studentId===s.id&&x.date===body.date);const row={...(old||{}),id:old?.id||await nextId(env,"attendance"),studentId:s.id,grade:s.assignedGrade,date:body.date,status:item.status,note:item.note||"",recordedBy:actor.id,createdAt:old?.createdAt||now()};await put(env,"attendance",row);}return json({ok:true});
+  }
+  // Reports
+  if(path==="/api/reports"&&method==="GET"){
+    let rows=await enriched(env,await all(env,"reports"),"submittedBy",u=>({submitterName:u.fullName}));if(actor.role==="head"){}else if(actor.role==="dept_head"&&actor.department)rows=rows.filter(x=>x.department===actor.department);else rows=[];rows.sort(sortNewest);return json({reports:rows});
+  }
+  if(path==="/api/reports"&&method==="POST"){
+    if(actor.role!=="dept_head"||!actor.department)return err("ሪፖርት ማቅረብ የሚችሉት የክፍል ተመዳቢ ሀላፊዎች ብቻ ናቸው።",403);
+    if(!body.title||!body.content)return err("እባክዎ የሪፖርቱን ርዕስና የፅሁፍ ዝርዝር ያስገቡ።");
+    let pdfUrl=null,pdfName=null;if(body.originalFileName||body.googleDriveFileId){const f=await createStoredFile({...body,resourceType:"pdf"});if(!f||f.resourceType!=="pdf")return err("ለሪፖርት ማያያዣ የተፈቀደው PDF ፋይል ብቻ ነው።");pdfUrl=f.fileUrl;pdfName=f.fileName;}
+    const id=await nextId(env,"reports"),r={id,department:actor.department,submittedBy:actor.id,title:String(body.title).trim(),content:String(body.content).trim(),pdfUrl,pdfName,status:"pending",createdAt:now()};await put(env,"reports",r);return json({report:{...r,submitterName:actor.fullName}},201);
+  }
+  if(idMatch&&idMatch[1]==="reports"&&method==="PATCH"){if(actor.role!=="head")return err("ፈቃድ የለዎትም።",403);const r=await get(env,"reports",Number(idMatch[2]));if(r){r.status=body.status==="reviewed"?"reviewed":"pending";await put(env,"reports",r);}return json({ok:true});}
+  // Directives
+  if(path==="/api/directives"&&method==="GET"){
+    let rows=await enriched(env,await all(env,"directives"),"senderId",u=>({senderName:u.fullName,senderRole:u.role}));if(actor.role==="head"){}else if(actor.role==="dept_head"&&actor.department)rows=rows.filter(d=>d.targetDepartment===actor.department);else if(actor.role==="dept_member"&&actor.department)rows=rows.filter(d=>d.targetDepartment===actor.department&&d.targetScope==="dept_members");else rows=[];rows.sort(sortNewest);return json({directives:rows});
+  }
+  if(path==="/api/directives"&&method==="POST"){
+    if(!body.title||!body.body)return err("እባክዎ የትዕዛዙን ርዕስና ዝርዝር መልእክት ያስገቡ።");
+    let target,scope;if(actor.role==="head"){if(!body.targetDepartment)return err("እባክዎ ትዕዛዙ የሚላክለትን ክፍል ይምረጡ።");target=body.targetDepartment;scope="dept_head";}else if(actor.role==="dept_head"&&actor.department){target=actor.department;scope="dept_members";}else return err("ትዕዛዝ ለማስተላለፍ ፈቃድ የለዎትም።",403);
+    const id=await nextId(env,"directives"),d={id,senderId:actor.id,targetDepartment:target,targetScope:scope,title:String(body.title).trim(),body:String(body.body).trim(),status:"active",createdAt:now()};await put(env,"directives",d);return json({directive:{...d,senderName:actor.fullName,senderRole:actor.role}},201);
+  }
+  if(idMatch&&idMatch[1]==="directives"&&method==="PATCH"){
+    const id=Number(idMatch[2]),d=await get(env,"directives",id);if(!d)return err("ትዕዛዙ አልተገኘም።",404);if(actor.role!=="head"&&actor.department!==d.targetDepartment)return err("ፈቃድ የለዎትም።",403);d.status="acknowledged";await put(env,"directives",d);return json({ok:true});
+  }
+  // Department materials
+  if(path==="/api/dept-materials"&&method==="GET"){
+    let rows=await enriched(env,await all(env,"materials"),"uploadedBy",u=>({uploaderName:u.fullName}));if(actor.role==="head"){}else if(["dept_head","dept_member"].includes(actor.role)&&actor.department){rows=rows.filter(m=>m.department===actor.department);if(actor.role==="dept_member")rows=rows.map(m=>({...m,fileUrl:"/api/files/download?kind=material&id="+m.id}));}else rows=[];rows.sort(sortNewest);return json({materials:rows});
+  }
+  if(path==="/api/dept-materials"&&method==="POST"){
+    if(actor.role!=="dept_head"||!actor.department)return err("ለክፍል አባላት ፋይል መስጠት የሚችሉት የክፍሉ ተመዳቢ ሀላፊዎች ብቻ ናቸው።",403);
+    if(!body.title||!body.originalFileName&&!body.googleDriveFileId)return err("እባክዎ ርዕስና ፋይል ያስገቡ።");
+    const f=await createStoredFile(body);if(!f||!f.resourceType)return err("የማይታወቅ የፋይል አይነት ነው።");
+    const dept=await get(env,"departments",actor.department),allows=dept?Boolean(dept.allowsMedia):actor.department==="choir";if(!allows&&f.resourceType!=="pdf")return err("ለዚህ ክፍል ለአባላት መስጠት የሚፈቀደው የPDF ፋይል ብቻ ነው። (ኦዲዮና ቪዲዮ ለመዝሙር ክፍል ወይም ለተፈቀደለት ክፍል ብቻ ነው)");
+    const id=await nextId(env,"materials"),m={id,department:actor.department,title:String(body.title).trim(),description:String(body.description||"").trim(),fileType:f.resourceType,fileUrl:f.fileUrl,fileName:f.fileName,uploadedBy:actor.id,createdAt:now()};await put(env,"materials",m);return json({material:{...m,uploaderName:actor.fullName}},201);
+  }
+  if(idMatch&&idMatch[1]==="dept-materials"&&method==="DELETE"){
+    const id=Number(idMatch[2]),m=await get(env,"materials",id);if(!m)return err("ፋይሉ አልተገኘም።",404);if(actor.role!=="head"&&m.uploadedBy!==actor.id)return err("ፈቃድ የለዎትም።",403);await remove(env,"materials",id);return json({ok:true});
+  }
+  // Targeted messages
+  if(path==="/api/messages"&&method==="GET"){
+    const users=await all(env,"users"),rows=await all(env,"messages");let enrichedRows=rows.map(m=>{const u=users.find(x=>x.id===m.senderId);return {...m,senderName:u?.fullName||"",senderRole:u?.role||"",senderDepartment:u?.department||null};}).sort(sortNewest);
+    const can=actor.role==="head"||(["dept_head","dept_member"].includes(actor.role)&&actor.department==="member_admin");
+    if(!can)enrichedRows=enrichedRows.filter(m=>m.targetType==="all"||(actor.role==="student"&&actor.assignedGrade&&((m.targetType==="grade"&&Number(m.targetValue)===actor.assignedGrade)||(m.targetType==="division"&&m.targetValue===division(actor.assignedGrade))))||(actor.role==="teacher"&&(m.targetType==="teachers"||(actor.assignedGrade&&((m.targetType==="grade"&&Number(m.targetValue)===actor.assignedGrade)||(m.targetType==="division"&&m.targetValue===division(actor.assignedGrade)))))||(["dept_head","dept_member"].includes(actor.role)&&actor.department&&m.targetType==="department"&&m.targetValue===actor.department));
+    return json({messages:enrichedRows});
+  }
+  if(path==="/api/messages"&&method==="POST"){
+    const can=actor.role==="head"||(["dept_head","dept_member"].includes(actor.role)&&actor.department==="member_admin");if(!can)return err("መልእክት ለሁሉም ክፍላት ማስተላለፍ የሚችሉት የሰንበት ትምህርት ቤት ሀላፊ፣ የአባላት አስተዳደር ሀላፊ እና የአባላት አስተዳደር ክፍል አባላት ብቻ ናቸው።",403);
+    if(!body.targetType||!body.targetValue||!body.title||!body.body)return err("እባክዎ ተቀባይ ክፍል፣ ርዕስ እና መልእክት ያስገቡ።");
+    const id=await nextId(env,"messages"),m={id,senderId:actor.id,targetType:String(body.targetType),targetValue:String(body.targetValue),title:String(body.title).trim(),body:String(body.body).trim(),createdAt:now()};await put(env,"messages",m);return json({message:{...m,senderName:actor.fullName,senderRole:actor.role,senderDepartment:actor.department||null}},201);
+  }
+  if(path.startsWith("/api/"))return err("API endpoint not found.",404);
+  // Safe SPA fallback: missing ASSETS must not hide API failures.
+  if(env.ASSETS){const asset=await env.ASSETS.fetch(request);if(asset.status!==404)return asset;const index=await env.ASSETS.fetch(new Request(new URL("/index.html",request.url),request));if(index.ok)return index;return asset;}
+  return new Response("Frontend assets binding ASSETS is unavailable.",{status:500});
+}
+export default {async fetch(request,env){try{return await handler(request,env);}catch(e){console.error("SENBET Worker error",e);if(new URL(request.url).pathname.startsWith("/api/"))return err("የአገልጋይ ስህተት ተከስቷል።",500);return new Response("Internal Server Error",{status:500});}}};
