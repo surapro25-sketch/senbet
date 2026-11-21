@@ -104,24 +104,6 @@ export interface GoogleDriveUploadResult {
   mimeType: string;
 }
 
-async function getGoogleDriveScriptUrl(): Promise<string> {
-  const envUrl = (import.meta as any).env?.VITE_GOOGLE_DRIVE_SCRIPT_URL;
-  if (typeof envUrl === 'string' && envUrl.trim()) {
-    return envUrl.trim();
-  }
-  try {
-    const cfg = await apiFetch<{ enabled?: boolean; scriptUrl?: string | null }>(
-      '/api/files/upload-config'
-    );
-    if (cfg?.enabled && typeof cfg.scriptUrl === 'string' && cfg.scriptUrl.trim()) {
-      return cfg.scriptUrl.trim();
-    }
-  } catch {
-    // Fall back to server/local upload if config lookup is unavailable
-  }
-  return '';
-}
-
 function readFileAsBase64(
   file: File,
   onProgress?: (percent: number) => void
@@ -150,94 +132,25 @@ function readFileAsBase64(
   });
 }
 
-function postTextJsonWithProgress(
-  url: string,
-  payloadJson: string,
-  onProgress?: (percent: number) => void
-): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', url, true);
-    // text/plain avoids CORS preflight against Google Apps Script Web Apps
-    xhr.setRequestHeader('Content-Type', 'text/plain;charset=utf-8');
-
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable && event.total > 0) {
-        const uploadRatio = event.loaded / event.total;
-        onProgress?.(Math.min(95, 35 + Math.round(uploadRatio * 60)));
-      }
-    };
-
-    xhr.onerror = () => {
-      reject(new Error('ወደ Google Drive መጫን አልተቻለም (የኔትወርክ ግንኙነት ስህተት)።'));
-    };
-
-    xhr.ontimeout = () => {
-      reject(new Error('የGoogle Drive መጫን ጊዜው አልፏል። እባክዎ እንደገና ይሞክሩ።'));
-    };
-
-    xhr.onload = () => {
-      const raw = xhr.responseText || '';
-      let parsed: any = null;
-      try {
-        parsed = raw ? JSON.parse(raw) : null;
-      } catch {
-        parsed = null;
-      }
-
-      if (xhr.status < 200 || xhr.status >= 300) {
-        const msg = parsed?.error || parsed?.message || `HTTP ${xhr.status}`;
-        reject(new Error(`ወደ Google Drive መጫን አልተቻለም (${msg})።`));
-        return;
-      }
-
-      if (!parsed) {
-        reject(new Error('ከGoogle Drive ትክክለኛ የJSON ምላሽ አልተገኘም።'));
-        return;
-      }
-
-      if (parsed.error || parsed.status === 'error') {
-        reject(new Error(String(parsed.error || parsed.message || 'Google Drive ስህተት መልሷል።')));
-        return;
-      }
-
-      resolve(parsed);
-    };
-
-    xhr.send(payloadJson);
-  });
-}
-
 export async function uploadFileToGoogleDriveIfConfigured(
   file: File,
   onProgress?: (percent: number) => void
 ): Promise<GoogleDriveUploadResult | null> {
-  const scriptUrl = await getGoogleDriveScriptUrl();
-  if (!scriptUrl) {
-    return null;
-  }
-
   onProgress?.(1);
   const mimeType = file.type || 'application/octet-stream';
   const base64 = await readFileAsBase64(file, onProgress);
-  const body = JSON.stringify({
-    fileName: file.name,
-    mimeType,
-    base64,
+  const data = await apiFetch<{ fileId?: string }>('/api/files/upload', {
+    method: 'POST',
+    body: JSON.stringify({
+      fileName: file.name,
+      mimeType,
+      base64,
+    }),
   });
-
-  const data = await postTextJsonWithProgress(scriptUrl, body, onProgress);
-  const fileId =
-    typeof data?.fileId === 'string' && data.fileId.trim()
-      ? data.fileId.trim()
-      : typeof data?.id === 'string' && data.id.trim()
-      ? data.id.trim()
-      : '';
-
+  const fileId = typeof data?.fileId === 'string' ? data.fileId.trim() : '';
   if (!fileId) {
     throw new Error('Google Drive የፋይል መለያ (fileId) አልመለሰም።');
   }
-
   onProgress?.(98);
   return {
     googleDriveFileId: fileId,
