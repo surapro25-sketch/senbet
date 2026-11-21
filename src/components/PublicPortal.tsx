@@ -245,6 +245,15 @@ export function PublicPortal({ onAuthenticated }: PublicPortalProps) {
             የተመዘገቡ ተማሪዎች PDF፣ ኦዲዮ እና ቪዲዮ ትምህርቶችን የሚያገኙበት፣ መምህራን ውጤትና አቴንዳንስ
             መዝግበው በPDF የሚያወርዱበት ዘመናዊ መድረክ።
           </p>
+          <section aria-labelledby="school-search-identity" className="mt-6 border-t border-white/15 pt-5">
+            <h2 id="school-search-identity" className="text-sm font-semibold text-amber-100">
+              ሰንበት ትምህርት ቤት · Ethiopian Orthodox Sunday School Portal
+            </h2>
+            <p className="mt-2 text-xs leading-relaxed text-white/80">
+              ደቂቀ መዊዕ ቅዱስ መርቆሬዎስ እና መጥምቀ መለኮት ቅዱስ ዮሐንስ የሰንበት ትምህርት ቤት መምህራን እና ተማሪዎች የሚጠቀሙበት የኢትዮጵያ ኦርቶዶክስ ተዋሕዶ ሰንበት ትምህርት ቤት የትምህርት መድረክ ነው።
+              Search names and transliterations: ደቂቀ መዊዕ · ቅዱስ መርቆሬዎስ · መጥምቀ መለኮት ቅዱስ ዮሐንስ · ደቂቀ መዊዕ ቅዱስ መርቆሬዎስ እና መጥምቀ መለኮት ቅዱስ ዮሐንስ · ሰንበት ትምህርት ቤት · ሰንበት · የሰንበት ትምህርት ቤት መምህራን እና ተማሪዎች · የኢትዮጵያ ኦርቶዶክስ ተዋሕዶ ሰንበት ትምህርት ቤት · Dekike Mewi · Dekike Mewie · Dekike Mewi Kidus Merkorios · Kidus Merkorios · St. Mercurius · Saint Mercurius · Metmike Melekot Kidus Yohannes · Kidus Yohannes · St. John the Baptist · Dekike Mewi Kidus Merkorios and Metmike Melekot Kidus Yohannes Sunday School · Senbet · Senbet Timhirt Bet · Senbet Temari · Sunday School · Ethiopian Orthodox Sunday School Portal · Addis Ababa Sunday School.
+            </p>
+          </section>
         </div>
       </section>
 
