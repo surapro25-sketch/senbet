@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+
+Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
