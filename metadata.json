@@ -1,0 +1,6 @@
+{
+  "name": "ሰንበት ትምህርት ቤት — የትምህርትና አስተዳደር መድረክ",
+  "description": "የሰንበት ትምህርት ቤት የተማሪዎች ምዝገባ፣ የትምህርት ግብአት (PDF፣ ኦዲዮ፣ ቪዲዮ)፣ የፈተና ውጤት፣ አቴንዳንስ እና የክፍላት አስተዳደር ስርዓት",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
