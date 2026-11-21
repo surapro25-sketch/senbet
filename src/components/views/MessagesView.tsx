@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { MessageSquare, Send } from 'lucide-react';
 import { apiFetch } from '../../utils/api';
+import { fuzzySearch } from '../../utils/fuzzySearch';
 import {
   DEFAULT_DEPARTMENTS,
   DIVISIONS,
@@ -18,6 +19,7 @@ interface MessagesViewProps {
 
 export function MessagesView({ currentUser }: MessagesViewProps) {
   const [messages, setMessages] = useState<TargetedMessage[]>([]);
+  const [search, setSearch] = useState('');
   const [departments, setDepartments] = useState<DepartmentRecord[]>(DEFAULT_DEPARTMENTS);
   const [loading, setLoading] = useState(true);
   const [targetType, setTargetType] = useState<'all' | 'division' | 'grade' | 'department' | 'teachers'>('division');
@@ -56,6 +58,14 @@ export function MessagesView({ currentUser }: MessagesViewProps) {
   useEffect(() => {
     loadMessages();
   }, []);
+
+  const messageSearch = fuzzySearch(
+    search,
+    messages,
+    (message) => [message.title, message.body, message.senderName, formatMessageTarget(message.targetType, message.targetValue)].join(' '),
+    (message) => message.title,
+  );
+  const visibleMessages = search.trim() ? messageSearch.matches : messages;
 
   function handleTargetTypeChange(nextType: typeof targetType) {
     setTargetType(nextType);
@@ -228,19 +238,36 @@ export function MessagesView({ currentUser }: MessagesViewProps) {
         </form>
       )}
 
-      {/* Messages Feed */}
+      {/* Searchable Messages and Announcements Feed */}
       <div className="space-y-3">
+        <input
+          type="search"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="መልእክቶችን ወይም ማስታወቂያዎችን ፈልግ... / Search announcements..."
+          aria-label="Search messages and announcements"
+          className="glass-input w-full px-3.5 py-2.5 text-xs"
+        />
+        {search.trim() && messageSearch.suggestion && !messageSearch.exactMatch && (
+          <p className="px-1 text-xs text-amber-100/90" role="status">
+            ምናልባት ይህን ፈልገው ይሆን? / Did you mean:{' '}
+            <button type="button" onClick={() => setSearch(messageSearch.suggestion || '')} className="font-semibold text-amber-300 underline decoration-amber-300/60 underline-offset-2 hover:text-amber-200">
+              {messageSearch.suggestion}
+            </button>
+            ?
+          </p>
+        )}
         {loading ? (
           <div className="glass-card rounded-2xl p-8 text-center text-xs text-white/65">
             መልእክቶችን በመጫን ላይ...
           </div>
-        ) : messages.length === 0 ? (
+        ) : visibleMessages.length === 0 ? (
           <div className="glass-card rounded-2xl p-8 text-center text-xs text-white/65">
             <MessageSquare className="mx-auto mb-2 h-6 w-6 text-white/50" />
             <p>ወደ እርስዎ ክፍል የተላከ መልእክት የለም።</p>
           </div>
         ) : (
-          messages.map((msg) => (
+          visibleMessages.map((msg) => (
             <article key={msg.id} className="glass-card rounded-2xl p-5">
               <div className="flex flex-wrap items-center gap-2 text-xs text-white/65">
                 <span className="font-semibold text-amber-200">
