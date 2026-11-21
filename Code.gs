@@ -6,7 +6,7 @@
  *   https://www.googleapis.com/auth/drive
  *   https://www.googleapis.com/auth/script.external_request
  */
-const UPLOAD_FOLDER_ID = 'PASTE_YOUR_GOOGLE_DRIVE_UPLOAD_FOLDER_ID_HERE';
+const UPLOAD_FOLDER_ID = '1aKs4RBZXbibeaVinx-0zMkCXaM8o5zqb';
 const EXPIRATION_DAYS = 21;
 
 function doPost(e) {
