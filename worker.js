@@ -85,7 +85,7 @@ function extractGoogleDriveFileId(row){
       if(queryId&&/^[A-Za-z0-9_-]{10,}$/.test(queryId))return queryId;
     }
   }catch{}
-  const match=value.match(/(?:^|[?&/])(?:id=|d/)?([A-Za-z0-9_-]{20,})(?:[/?&#]|$)/);
+  const match=value.match(/[A-Za-z0-9_-]{20,}/);
   return match?match[1]:"";
 }
 async function trashGoogleDriveFile(env,row){
