@@ -296,7 +296,12 @@ function publicFileRecord(row,kind){
   return {...safe,fileUrl:download};
 }
 async function createStoredFile(env,body,actor){
-  const uploadId=String(body.uploadId||"").trim();if(!uploadId)return null;
+  const uploadId=String(body.uploadId||"").trim();
+  if(!uploadId){
+    const legacy=await legacyCreateStoredFile(body);if(!legacy)return null;
+    const driveId=legacy.fileUrl.slice(7);
+    return {...legacy,storageChunks:[{chunkIndex:0,byteLength:0,telegramFileId:null,googleDriveFileId:driveId}],uploadId:null};
+  }
   const raw=await env.SENBET_DB.get("upload:"+uploadId);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
   if(!stage||!stage.finalized||stage.userId!==actor.id)return null;
   const name=preserveFileName(stage.originalName),mime=stage.mimeType||mimeFor(name);
