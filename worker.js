@@ -545,8 +545,8 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
   if(path==="/api/reports"&&method==="POST"){
     if(actor.role!=="dept_head"||!actor.department)return err("ሪፖርት ማቅረብ የሚችሉት የክፍል ተመዳቢ ሀላፊዎች ብቻ ናቸው።",403);
     if(!body.title||!body.content)return err("እባክዎ የሪፖርቱን ርዕስና የፅሁፍ ዝርዝር ያስገቡ።");
-    let pdfUrl=null,pdfName=null;if(body.uploadId){const f=await createStoredFile(env,{...body,resourceType:"pdf"},actor);if(!f||f.resourceType!=="pdf")return err("ለሪፖርት ማያያዣ የተፈቀደው PDF ፋይል ብቻ ነው።");pdfUrl=f.fileUrl;pdfName=f.fileName;}
-    const reportUpload=body.uploadId?await createStoredFile(env,{...body,resourceType:"pdf"},actor):null;
+    let pdfUrl=null,pdfName=null;if(body.uploadId||body.googleDriveFileId){const f=await createStoredFile(env,{...body,resourceType:"pdf"},actor);if(!f||f.resourceType!=="pdf")return err("ለሪፖርት ማያያዣ የተፈቀደው PDF ፋይል ብቻ ነው።");pdfUrl=f.fileUrl;pdfName=f.fileName;}
+    const reportUpload=(body.uploadId||body.googleDriveFileId)?await createStoredFile(env,{...body,resourceType:"pdf"},actor):null;
     const id=await nextId(env,"reports"),r={id,department:actor.department,submittedBy:actor.id,title:String(body.title).trim(),content:String(body.content).trim(),pdfUrl,pdfName,storageChunks:reportUpload?.storageChunks||null,googleDriveFileIds:reportUpload?.storageChunks?.map(chunk=>chunk.googleDriveFileId||null)||[],telegramFileIds:reportUpload?.storageChunks?.map(chunk=>chunk.telegramFileId||null)||[],telegramPermanent:Boolean(reportUpload?.storageChunks?.length&&reportUpload.storageChunks.every(chunk=>Boolean(chunk?.telegramFileId))),status:"pending",createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"reports",r);return json({report:{...publicFileRecord(r,"report"),submitterName:actor.fullName}},201);
   }
   if(idMatch&&["reports","departments/reports"].includes(idMatch[1])&&method==="PATCH"){if(actor.role!=="head")return err("ፈቃድ የለዎትም።",403);const r=await get(env,"reports",Number(idMatch[2]));if(r){r.status=body.status==="reviewed"?"reviewed":"pending";await put(env,"reports",r);}return json({ok:true});}
