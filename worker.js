@@ -243,9 +243,10 @@ async function uploadSingleFile(env,actor,body){
   const chunkBody={...body,file,uploadId,chunkIndex:0,totalChunks:1,fileSize:file.size,originalName:body.originalName||body.originalFileName||file.name,mimeType:body.mimeType||file.type||"application/octet-stream"};
   const uploaded=await uploadChunkCore(env,actor,chunkBody);
   if(!uploaded.ok)return uploaded;
+  const uploadResult=await uploaded.json().catch(()=>({}));
   const finalized=await finalizeUpload(env,actor,uploadId);
   if(!finalized.ok)return finalized;
-  return json({...(await finalized.json()),ok:true},201);
+  return json({...(await finalized.json()),fileId:uploadResult.fileId||null,ok:true},201);
 }
 async function driveChunkBytes(env,fileId){
   const script=googleDriveScriptUrl(env);let upstream=null;
