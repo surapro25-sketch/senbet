@@ -49,7 +49,7 @@ export async function apiFetch<T = any>(
       throw new Error(data.error);
     }
     if (res.status === 413) {
-      throw new Error('የፋይሉ መጠን ከተፈቀደው 250 MB ገደብ በልጧል።');
+      throw new Error('የፋይል መጠኑ ከመጫኛ ገደቡ በልጧል። እስከ 250 MB ድረስ ይጫኑ።');
     }
     if (res.status === 502 || res.status === 504) {
       throw new Error('የአገልጋይ ግንኙነት ጊዜው አልፏል ወይም ተቋርጧል። እባክዎ እንደገና ይሞክሩ።');
@@ -98,109 +98,70 @@ export function getEntityPreviewUrl(
   return fileUrl;
 }
 
-export interface GoogleDriveUploadResult {
-  googleDriveFileId: string;
+export interface StoredFileUploadResult {
+  uploadId: string;
   originalFileName: string;
   mimeType: string;
 }
 
-function readFileAsBase64(
-  file: File,
-  onProgress?: (percent: number) => void
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onprogress = (event) => {
-      if (event.lengthComputable && event.total > 0) {
-        onProgress?.(Math.min(35, Math.round((event.loaded / event.total) * 35)));
-      }
-    };
-    reader.onerror = () => {
-      reject(new Error('ፋይሉን ለማንበብ አልተቻለም።'));
-    };
-    reader.onload = () => {
-      const result = typeof reader.result === 'string' ? reader.result : '';
-      const commaIdx = result.indexOf(',');
-      if (commaIdx === -1) {
-        reject(new Error('ፋይሉን ወደ Base64 መቀየር አልተቻለም።'));
-        return;
-      }
-      onProgress?.(35);
-      resolve(result.slice(commaIdx + 1));
-    };
-    reader.readAsDataURL(file);
-  });
-}
+const SINGLE_UPLOAD_LIMIT = 15 * 1024 * 1024;
+const MAX_UPLOAD_LIMIT = 250 * 1024 * 1024;
 
-function uploadFileDirectToGoogleDrive(
+export async function uploadFileToStorage(
   file: File,
-  uploadUrl: string,
   onProgress?: (percent: number) => void
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('PUT', uploadUrl, true);
-    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-    xhr.setRequestHeader('Content-Range', `bytes 0-${file.size - 1}/${file.size}`);
-    xhr.timeout = 0;
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable && event.total > 0) {
-        onProgress?.(Math.min(97, Math.round((event.loaded / event.total) * 97)));
-      }
-    };
-    xhr.onerror = () => reject(new Error('Google Drive ቀጥታ መጫን አልተቻለም። እባክዎ የኔትወርክ ግንኙነትዎን ያረጋግጡ።'));
-    xhr.ontimeout = () => reject(new Error('የGoogle Drive መጫን ጊዜው አልፏል።'));
-    xhr.onload = () => {
-      let parsed: any = null;
-      try { parsed = xhr.responseText ? JSON.parse(xhr.responseText) : null; } catch { parsed = null; }
-      if (xhr.status < 200 || xhr.status >= 300) {
-        reject(new Error(parsed?.error?.message || parsed?.error || `Google Drive HTTP ${xhr.status}`));
-        return;
-      }
-      const fileId = typeof parsed?.id === 'string' ? parsed.id.trim() : typeof parsed?.fileId === 'string' ? parsed.fileId.trim() : '';
-      if (!fileId) {
-        reject(new Error('Google Drive የፋይል መለያ (fileId) አልመለሰም።'));
-        return;
-      }
-      onProgress?.(98);
-      resolve(fileId);
-    };
-    xhr.send(file);
-  });
-}
+): Promise<StoredFileUploadResult> {
+  if (!file || file.size <= 0) {
+    throw new Error('እባክዎ ባዶ ያልሆነ ፋይል ይምረጡ።');
+  }
+  if (file.size > MAX_UPLOAD_LIMIT) {
+    throw new Error('የፋይሉ መጠን ከ250 MB መብለጥ የለበትም።');
+  }
 
-export async function uploadFileToGoogleDriveIfConfigured(
-  file: File,
-  onProgress?: (percent: number) => void
-): Promise<GoogleDriveUploadResult | null> {
-  onProgress?.(1);
+  const uploadId = crypto.randomUUID();
   const mimeType = file.type || 'application/octet-stream';
-  let fileId = '';
+  const totalChunks = Math.ceil(file.size / SINGLE_UPLOAD_LIMIT);
+  onProgress?.(0);
 
-  // Prefer a resumable session; only fall back to the Worker proxy if session creation fails.
-  let uploadUrl = '';
-  try {
-    const session = await apiFetch<{ uploadUrl?: string }>('/api/files/upload-session', {
+  if (totalChunks === 1) {
+    const form = new FormData();
+    form.append('uploadId', uploadId);
+    form.append('chunkIndex', '0');
+    form.append('totalChunks', '1');
+    form.append('fileSize', String(file.size));
+    form.append('originalName', file.name);
+    form.append('mimeType', mimeType);
+    form.append('file', file, file.name);
+
+    await apiFetch('/api/files/upload', { method: 'POST', body: form });
+    onProgress?.(100);
+  } else {
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      const start = chunkIndex * SINGLE_UPLOAD_LIMIT;
+      const end = Math.min(start + SINGLE_UPLOAD_LIMIT, file.size);
+      const chunk = file.slice(start, end, mimeType);
+      const form = new FormData();
+      form.append('uploadId', uploadId);
+      form.append('chunkIndex', String(chunkIndex));
+      form.append('totalChunks', String(totalChunks));
+      form.append('fileSize', String(file.size));
+      form.append('originalName', file.name);
+      form.append('mimeType', mimeType);
+      form.append('file', chunk, file.name);
+
+      await apiFetch('/api/files/upload-chunk', {
+        method: 'POST',
+        body: form,
+      });
+      onProgress?.(Math.min(95, Math.round((end / file.size) * 95)));
+    }
+
+    await apiFetch('/api/files/finalize', {
       method: 'POST',
-      body: JSON.stringify({ fileName: file.name, mimeType, fileSize: file.size }),
+      body: JSON.stringify({ uploadId }),
     });
-    uploadUrl = typeof session?.uploadUrl === 'string' ? session.uploadUrl : '';
-    if (!uploadUrl) throw new Error('Google Drive upload session URL was not returned.');
-  } catch (sessionError) {
-    console.warn('Resumable upload session unavailable; using proxy upload fallback.', sessionError);
-    const base64 = await readFileAsBase64(file, onProgress);
-    const fallback = await apiFetch<{ fileId?: string }>('/api/files/upload', {
-      method: 'POST',
-      body: JSON.stringify({ fileName: file.name, mimeType, base64 }),
-    });
-    fileId = typeof fallback?.fileId === 'string' ? fallback.fileId.trim() : '';
+    onProgress?.(100);
   }
 
-  if (uploadUrl) {
-    fileId = await uploadFileDirectToGoogleDrive(file, uploadUrl, onProgress);
-  }
-  if (!fileId) throw new Error('Google Drive የፋይል መለያ (fileId) አልመለሰም።');
-  onProgress?.(99);
-  return { googleDriveFileId: fileId, originalFileName: file.name, mimeType };
+  return { uploadId, originalFileName: file.name, mimeType };
 }
-
