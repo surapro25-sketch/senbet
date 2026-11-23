@@ -57,7 +57,7 @@ function mimeFor(name){const e=(name.split(".").pop()||"").toLowerCase();return 
 function resourceType(name,mime,explicit){const n=(name||"").toLowerCase(),m=(mime||"").toLowerCase();if(m==="application/pdf"||n.endsWith(".pdf"))return "pdf";if(m.startsWith("audio/")||/\.(mp3|wav|ogg|m4a|aac)$/.test(n))return "audio";if(m.startsWith("video/")||/\.(mp4|webm|mov|mkv|avi)$/.test(n))return "video";return ["pdf","audio","video"].includes(explicit)?explicit:null;}
 function safeName(s){return String(s||"file").split(/[\\/]/).pop().replace(/[\r\n"]/g,"_");}
 function disposition(type,name){const n=safeName(name||"download");const ascii=n.replace(/[^\x20-\x7e]/g,"_").replace(/"/g,"'");return type+'; filename="'+ascii+'"; filename*=UTF-8\'\''+encodeURIComponent(n);}
-async function readBody(req){const ct=req.headers.get("content-type")||"";if(ct.includes("application/json"))return await req.json().catch(()=>({}));if(ct.includes("multipart/form-data")){const f=await req.formData(),o={};for(const [k,v] of f.entries()){if(typeof v==="string")o[k]=v;else if(v&&v.name){o.file=v;o.originalFileName=v.name;o.mimeType=v.type;}}return o;}return {};}
+async function readBody(req){const ct=req.headers.get("content-type")||"";if(ct.includes("application/json"))return await req.json().catch(()=>({}));if(ct.includes("multipart/form-data")){const f=await req.formData(),o={};for(const [k,v] of f.entries()){if(typeof v==="string")o[k]=v;else if(v&&typeof v.arrayBuffer==="function"){o.file=v;if(!o.originalFileName&&v.name)o.originalFileName=v.name;if(!o.mimeType&&v.type)o.mimeType=v.type;}}return o;}return {};}
 async function ensureSeed(env){
   if(await env.SENBET_DB.get("meta:initialized"))return;
   const depts=[
@@ -82,7 +82,7 @@ async function auth(req,env){const token=(req.headers.get("authorization")||"").
 const joinedUser=(row,u,fields={})=>({...row,...fields});
 async function withUser(env,row,field){const u=await get(env,"users",row[field]);return u?{...row,[field==="uploadedBy"?"uploaderName":field==="submittedBy"?"submitterName":"senderName"]:u.fullName,...(field==="uploadedBy"?{uploaderRole:u.role}:{})}:row;}
 async function enriched(env,rows,foreign,extra){const out=[];for(const r of rows){const u=await get(env,"users",r[foreign]);out.push({...r,...(u?extra(u):{})});}return out;}
-async function getFile(env,kind,id){const table=kind==="resource"?"resources":kind==="material"?"materials":kind==="report"?"reports":null;const row=table?await get(env,table,Number(id)):null;if(!row)return null;return kind==="report"?{fileUrl:row.pdfUrl,fileName:row.pdfName||"report.pdf"}:{fileUrl:row.fileUrl,fileName:row.fileName};}
+async function getFile(env,kind,id){const table=kind==="resource"?"resources":kind==="material"?"materials":kind==="report"?"reports":null;const row=table?await get(env,table,Number(id)):null;if(!row)return null;return kind==="report"?{...row,fileUrl:row.pdfUrl,fileName:row.pdfName||"report.pdf"}:row;}
 function googleDriveScriptUrl(env){return String(env.GOOGLE_DRIVE_SCRIPT_URL||"").trim();}
 const FILE_TTL_MS=21*24*60*60*1000;
 function expirationTime(row){
@@ -110,21 +110,19 @@ function extractGoogleDriveFileId(row){
   const match=value.match(/[A-Za-z0-9_-]{20,}/);
   return match?match[1]:"";
 }
-async function trashGoogleDriveFile(env,row){
-  const fileId=extractGoogleDriveFileId(row);
+async function trashGoogleDriveFileId(env,fileId){
   if(!fileId)return true;
   const script=googleDriveScriptUrl(env);
   if(!script)throw new Error("GOOGLE_DRIVE_SCRIPT_URL is not configured; refusing to delete the KV record before its Drive file is trashed.");
-  const target=new URL(script);
-  target.searchParams.set("action","delete");
-  target.searchParams.set("fileId",fileId);
+  const target=new URL(script);target.searchParams.set("action","delete");target.searchParams.set("fileId",fileId);
   const response=await fetch(target.toString(),{method:"GET",redirect:"follow"});
-  const raw=await response.text();
-  let result=null;
-  try{result=raw?JSON.parse(raw):null;}catch{}
-  if(!response.ok||result?.error||result?.ok===false||result?.status==="error"){
-    throw new Error("Google Drive trash request failed ("+response.status+"): "+String(result?.error||result?.message||raw||"Unknown response").slice(0,300));
-  }
+  const raw=await response.text();let result=null;try{result=raw?JSON.parse(raw):null;}catch{}
+  if(!response.ok||result?.error||result?.ok===false||result?.status==="error")throw new Error("Google Drive trash request failed ("+response.status+"): "+String(result?.error||result?.message||raw||"Unknown response").slice(0,300));
+  return true;
+}
+async function trashGoogleDriveFile(env,row){
+  const ids=[...new Set([...(Array.isArray(row?.storageChunks)?row.storageChunks.map(x=>x?.googleDriveFileId).filter(Boolean):[]),extractGoogleDriveFileId(row)].filter(Boolean))];
+  for(const id of ids)await trashGoogleDriveFileId(env,id);
   return true;
 }
 async function purgeExpiredTable(env,table){
@@ -167,6 +165,135 @@ async function uploadToGoogleDrive(env,payload){
     return err("ወደ Google Drive መጫን አልተቻለም።",502);
   }
 }
+
+const UPLOAD_CHUNK_SIZE=15*1024*1024;
+const MAX_UPLOAD_SIZE=250*1024*1024;
+function preserveFileName(value){return String(value||"file").split(/[\\/]/).pop().replace(/[\r\n\0]/g,"_").trim()||"file";}
+function base64FromBytes(bytes){let binary="";for(let i=0;i<bytes.length;i+=0x8000)binary+=String.fromCharCode(...bytes.subarray(i,Math.min(i+0x8000,bytes.length)));return btoa(binary);}
+async function telegramStoreChunk(env,{blob,fileName,mimeType}){
+  const token=String(env.TELEGRAM_BOT_TOKEN||"").trim(),chatId=String(env.TELEGRAM_STORAGE_CHAT_ID||"").trim();
+  if(!token||!chatId)throw new Error("Telegram storage is not configured.");
+  const form=new FormData();form.append("chat_id",chatId);form.append("document",new Blob([await blob.arrayBuffer()],{type:mimeType||"application/octet-stream"}),fileName);
+  const response=await fetch("https://api.telegram.org/bot"+token+"/sendDocument",{method:"POST",body:form});
+  const raw=await response.text();let data=null;try{data=raw?JSON.parse(raw):null;}catch{}
+  const fileId=data?.result?.document?.file_id;
+  if(!response.ok||!data?.ok||typeof fileId!=="string"||!fileId)throw new Error(data?.description||"Telegram sendDocument failed (HTTP "+response.status+").");
+  return fileId;
+}
+async function driveStoreChunk(env,{bytes,fileName,mimeType}){
+  if(!googleDriveScriptUrl(env))throw new Error("Google Drive storage is not configured.");
+  const response=await uploadToGoogleDrive(env,{fileName,mimeType,base64:base64FromBytes(bytes)});
+  const data=await response.json().catch(()=>null);
+  if(!response.ok||!data?.fileId)throw new Error(data?.error||"Google Drive chunk upload failed.");
+  return data.fileId;
+}
+async function uploadChunkCore(env,actor,body){
+  const blob=body.file;
+  const uploadId=String(body.uploadId||"").trim(),chunkIndex=Number(body.chunkIndex),totalChunks=Number(body.totalChunks),fileSize=Number(body.fileSize);
+  const originalName=preserveFileName(body.originalName||body.originalFileName||blob?.name),mimeType=String(body.mimeType||blob?.type||mimeFor(originalName)).trim();
+  if(!blob||typeof blob.arrayBuffer!=="function"||!uploadId||!/^[A-Za-z0-9_-]{16,80}$/.test(uploadId)||!originalName||!Number.isInteger(chunkIndex)||!Number.isInteger(totalChunks)||!Number.isSafeInteger(fileSize)||fileSize<=0||fileSize>MAX_UPLOAD_SIZE||totalChunks!==Math.ceil(fileSize/UPLOAD_CHUNK_SIZE)||chunkIndex<0||chunkIndex>=totalChunks)return err("የፋይል ክፍሉ መረጃ ትክክል አይደለም።",400);
+  if(blob.size>UPLOAD_CHUNK_SIZE)return err("እያንዳንዱ የፋይል ክፍል ከ15 MB መብለጥ የለበትም።",413);
+  const expectedSize=Math.min(UPLOAD_CHUNK_SIZE,fileSize-chunkIndex*UPLOAD_CHUNK_SIZE);
+  if(blob.size!==expectedSize)return err("የፋይል ክፍሉ መጠን ከተጠበቀው ጋር አይዛመድም።",400);
+  const stageKey="upload:"+uploadId,stageRaw=await env.SENBET_DB.get(stageKey);let stage=null;
+  try{stage=stageRaw?JSON.parse(stageRaw):null;}catch{}
+  if(stage&&(stage.userId!==actor.id||stage.fileSize!==fileSize||stage.totalChunks!==totalChunks||stage.originalName!==originalName))return err("ይህ የመጫኛ መለያ ከዚህ ፋይል ጋር አይዛመድም።",409);
+  if(stage?.chunks?.[chunkIndex])return json({ok:true,chunkIndex,alreadyUploaded:true});
+  const bytes=new Uint8Array(await blob.arrayBuffer());
+  const driveName=originalName+".part-"+String(chunkIndex+1).padStart(3,"0");
+  const outcomes=await Promise.allSettled([
+    telegramStoreChunk(env,{blob,fileName:driveName,mimeType}),
+    driveStoreChunk(env,{bytes,fileName:driveName,mimeType})
+  ]);
+  const telegramFileId=outcomes[0].status==="fulfilled"?outcomes[0].value:null;
+  const googleDriveFileId=outcomes[1].status==="fulfilled"?outcomes[1].value:null;
+  if(!telegramFileId&&!googleDriveFileId){
+    console.error("Both upload storage targets failed",{telegram:String(outcomes[0].reason||""),drive:String(outcomes[1].reason||"")});
+    return err("ወደ Telegram ወይም Google Drive ማስቀመጥ አልተቻለም። እባክዎ የማገናኛ ቅንብሮችን ያረጋግጡና እንደገና ይሞክሩ።",502);
+  }
+  stage=stage||{uploadId,userId:actor.id,originalName,mimeType,fileSize,totalChunks,chunks:[],createdAt:Date.now()};
+  stage.chunks[chunkIndex]={chunkIndex,byteLength:blob.size,telegramFileId,googleDriveFileId};
+  await env.SENBET_DB.put(stageKey,JSON.stringify(stage),{expirationTtl:86400});
+  return json({ok:true,chunkIndex,storage:{telegram:!!telegramFileId,googleDrive:!!googleDriveFileId}});
+}
+async function finalizeUpload(env,actor,uploadId){
+  const key="upload:"+String(uploadId||"").trim(),raw=await env.SENBET_DB.get(key);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
+  if(!stage)return err("የመጫኛ ክፍለ ጊዜ አልተገኘም።",404);
+  if(stage.userId!==actor.id)return err("ፈቃድ የለዎትም።",403);
+  if(!Array.isArray(stage.chunks)||stage.chunks.length!==stage.totalChunks||stage.chunks.some((chunk,index)=>!chunk||chunk.chunkIndex!==index||(!chunk.telegramFileId&&!chunk.googleDriveFileId)))return err("ሁሉም የፋይል ክፍሎች ገና አልተጫኑም።",409);
+  stage.finalized=true;stage.finalizedAt=Date.now();await env.SENBET_DB.put(key,JSON.stringify(stage),{expirationTtl:86400});
+  return json({uploadId:stage.uploadId,originalFileName:stage.originalName,mimeType:stage.mimeType,fileSize:stage.fileSize,totalChunks:stage.totalChunks});
+}
+async function uploadSingleFile(env,actor,body){
+  let file=body.file;
+  if(!file&&typeof body.base64==="string"){
+    try{const binary=atob(body.base64);const bytes=Uint8Array.from(binary,c=>c.charCodeAt(0));file=new Blob([bytes],{type:body.mimeType||"application/octet-stream"});}catch{return err("Base64 ፋይሉ ትክክል አይደለም።",400);}
+  }
+  if(!file)return err("ፋይል አልተሰጠም።",400);
+  if(file.size>UPLOAD_CHUNK_SIZE)return err("ከ15 MB በላይ የሆነ ፋይል በቁራጭ መጫን አለበት።",413);
+  const uploadId=String(body.uploadId||crypto.randomUUID());
+  const chunkBody={...body,file,uploadId,chunkIndex:0,totalChunks:1,fileSize:file.size,originalName:body.originalName||body.originalFileName||file.name,mimeType:body.mimeType||file.type||"application/octet-stream"};
+  const uploaded=await uploadChunkCore(env,actor,chunkBody);
+  if(!uploaded.ok)return uploaded;
+  const finalized=await finalizeUpload(env,actor,uploadId);
+  if(!finalized.ok)return finalized;
+  return json({...(await finalized.json()),ok:true},201);
+}
+async function driveChunkBytes(env,fileId){
+  const script=googleDriveScriptUrl(env);let upstream=null;
+  if(script){const target=new URL(script);target.searchParams.set("fileId",fileId);upstream=await fetch(target.toString(),{redirect:"follow"});}
+  if(!upstream||!upstream.ok||(upstream.headers.get("content-type")||"").includes("text/html"))upstream=await fetch("https://drive.google.com/uc?export=download&confirm=t&id="+encodeURIComponent(fileId),{redirect:"follow"});
+  if(!upstream.ok)throw new Error("Google Drive chunk download failed.");
+  const ct=upstream.headers.get("content-type")||"";
+  if(ct.includes("application/json")){
+    const payload=await upstream.json();if(payload.error||payload.status==="error")throw new Error(payload.error||payload.message||"Google Drive error");
+    const encoded=payload.base64||payload.data;if(encoded){const binary=atob(String(encoded).split(",").pop());return Uint8Array.from(binary,c=>c.charCodeAt(0));}
+    const dest=payload.downloadUrl||payload.url;if(dest){const response=await fetch(dest);if(!response.ok)throw new Error("Google Drive download URL failed.");return new Uint8Array(await response.arrayBuffer());}
+    throw new Error("Google Drive returned no chunk content.");
+  }
+  return new Uint8Array(await upstream.arrayBuffer());
+}
+async function telegramChunkBytes(env,fileId){
+  const token=String(env.TELEGRAM_BOT_TOKEN||"").trim();if(!token)throw new Error("Telegram storage is not configured.");
+  const metaResponse=await fetch("https://api.telegram.org/bot"+token+"/getFile?file_id="+encodeURIComponent(fileId));
+  const meta=await metaResponse.json().catch(()=>null);const path=meta?.result?.file_path;
+  if(!metaResponse.ok||!meta?.ok||!path)throw new Error(meta?.description||"Telegram getFile failed.");
+  const response=await fetch("https://api.telegram.org/file/bot"+token+"/"+path);
+  if(!response.ok)throw new Error("Telegram file download failed.");
+  return new Uint8Array(await response.arrayBuffer());
+}
+async function storedChunkBytes(env,chunk){
+  if(chunk.googleDriveFileId){try{return await driveChunkBytes(env,chunk.googleDriveFileId);}catch(error){console.warn("Google Drive chunk unavailable; falling back to Telegram",error);}}
+  if(chunk.telegramFileId)return telegramChunkBytes(env,chunk.telegramFileId);
+  throw new Error("No available storage copy for this file chunk.");
+}
+async function storedFileResponse(env,target,type,filename){
+  const chunks=target.storageChunks;
+  if(!Array.isArray(chunks)||!chunks.length)return null;
+  let index=0;
+  const stream=new ReadableStream({
+    async pull(controller){
+      if(index>=chunks.length){controller.close();return;}
+      try{controller.enqueue(await storedChunkBytes(env,chunks[index++]));}
+      catch(error){controller.error(error);}
+    }
+  });
+  return new Response(stream,{status:200,headers:{"content-type":mimeFor(filename),"content-disposition":disposition(type,filename),"cache-control":"private, no-store","x-content-type-options":"nosniff"}});
+}
+function publicFileRecord(row,kind){
+  const {storageChunks,telegramFileIds,googleDriveFileIds,googleDriveFileId,...safe}=row;
+  const download="/api/files/download?kind="+encodeURIComponent(kind)+"&id="+encodeURIComponent(row.id);
+  if(kind==="report")return {...safe,pdfUrl:row.pdfName?download:null};
+  return {...safe,fileUrl:download};
+}
+async function createStoredFile(env,body,actor){
+  const uploadId=String(body.uploadId||"").trim();if(!uploadId)return null;
+  const raw=await env.SENBET_DB.get("upload:"+uploadId);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
+  if(!stage||!stage.finalized||stage.userId!==actor.id)return null;
+  const name=preserveFileName(stage.originalName),mime=stage.mimeType||mimeFor(name);
+  return {fileUrl:"",fileName:name,resourceType:resourceType(name,mime,body.resourceType||body.fileType),storageChunks:stage.chunks,uploadId};
+}
+
 async function fileResponse(request,env,kind){
   const url=new URL(request.url),type=kind==="preview"?"inline":"attachment";
   const entityKind=url.searchParams.get("kind"),id=url.searchParams.get("id"),raw=url.searchParams.get("file"),name=url.searchParams.get("name");
@@ -178,6 +305,8 @@ async function fileResponse(request,env,kind){
   }
   else if(raw){target={fileUrl:"/uploads/"+safeName(raw),fileName:safeName(raw)};filename=name||target.fileName;}
   else return err("የፋይል መለያ አልተሰጠም።",400);
+  const stored=await storedFileResponse(env,target,type,filename);
+  if(stored)return stored;
   const value=target.fileUrl||"";
   if(value.startsWith("gdrive:")){
     const script=googleDriveScriptUrl(env),fid=value.slice(7);
@@ -194,7 +323,7 @@ async function fileResponse(request,env,kind){
   if(value.startsWith("/uploads/"))return err("ይህ ፋይል በአሮጌው የአገልጋይ ዲስክ ላይ ነበር፤ ወደ Google Drive እንደገና ይጫኑት።",404);
   return err("የፋይሉ አድራሻ ትክክል አይደለም።",400);
 }
-async function createStoredFile(body,field="file"){
+async function legacyCreateStoredFile(body){
   const name=safeName(body.originalFileName||body.file?.name||"");
   const mime=body.mimeType||body.file?.type||mimeFor(name);
   const drive=String(body.googleDriveFileId||"").trim();
@@ -251,10 +380,17 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
     if(!fileName||!Number.isSafeInteger(fileSize)||fileSize<=0)return err("የፋይል መረጃው ትክክል አይደለም።",400);
     return createGoogleDriveUploadSession(env,{fileName,mimeType,fileSize});
   }
+  if(path==="/api/files/upload-chunk"&&method==="POST"){
+    if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
+    return uploadChunkCore(env,actor,body);
+  }
+  if(path==="/api/files/finalize"&&method==="POST"){
+    if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
+    return finalizeUpload(env,actor,body.uploadId);
+  }
   if(path==="/api/files/upload"&&method==="POST"){
-    const fileName=safeName(body.fileName),mimeType=String(body.mimeType||"application/octet-stream").trim(),base64=String(body.base64||"").trim();
-    if(!fileName||!base64||!/^[A-Za-z0-9+/]*={0,2}$/.test(base64))return err("የፋይል መረጃው ትክክል አይደለም።",400);
-    return uploadToGoogleDrive(env,{fileName,mimeType,base64});
+    if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
+    return uploadSingleFile(env,actor,body);
   }
   const idMatch=path.match(/^\/api\/(users|resources|exams|reports|directives|dept-materials|departments\/materials|departments\/reports)\/(\d+)$/);
   // Departments
@@ -334,16 +470,16 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
   if(path==="/api/resources"&&method==="GET"){
     await purgeExpiredTable(env,"resources");
     let rows=await enriched(env,await all(env,"resources"),"uploadedBy",u=>({uploaderName:u.fullName,uploaderRole:u.role}));rows.sort(sortNewest);
-    if(actor.role==="student"&&actor.assignedGrade){const d=division(actor.assignedGrade);rows=rows.filter(r=>(r.targetGrade==null&&["all",d].includes(r.targetDivision))||r.targetGrade===actor.assignedGrade).map(r=>({...r,fileUrl:"/api/files/download?kind=resource&id="+r.id}));}
-    return json({resources:rows});
+    if(actor.role==="student"&&actor.assignedGrade){const d=division(actor.assignedGrade);rows=rows.filter(r=>(r.targetGrade==null&&["all",d].includes(r.targetDivision))||r.targetGrade===actor.assignedGrade);}
+    return json({resources:rows.map(r=>publicFileRecord(r,"resource"))});
   }
   if(path==="/api/resources"&&method==="POST"){
     if(!["head","teacher","dept_head"].includes(actor.role))return err("የትምህርት ግብአት ለመጫን ፈቃድ የለዎትም።",403);
     if(!String(body.title||"").trim())return err("እባክዎ የትምህርት ግብአቱን ርዕስ ያስገቡ።");
-    const file=await createStoredFile(body);if(!file)return err("እባክዎ ፋይል (PDF፣ Audio ወይም Video) ይምረጡ።");
+    const file=await createStoredFile(env,body,actor);if(!file)return err("እባክዎ ፋይሉን በትክክል ይጫኑና ይጨርሱ።");
     if(!file.resourceType)return err("የተፈቀዱት የፋይል አይነቶች PDF፣ Audio እና Video ብቻ ናቸው።");
     let grade=body.targetGrade?Number(body.targetGrade):null,div=body.targetDivision||"all";if(actor.role==="teacher"&&actor.assignedGrade&&!grade&&div==="all")grade=actor.assignedGrade;if(grade)div=division(grade);
-    const id=await nextId(env,"resources"),r={id,title:String(body.title).trim(),description:String(body.description||"").trim(),resourceType:file.resourceType,fileUrl:file.fileUrl,fileName:file.fileName,targetGrade:grade,targetDivision:div,uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"resources",r);return json({resource:{...r,uploaderName:actor.fullName,uploaderRole:actor.role}},201);
+    const id=await nextId(env,"resources"),r={id,title:String(body.title).trim(),description:String(body.description||"").trim(),resourceType:file.resourceType,fileUrl:file.fileUrl,fileName:file.fileName,storageChunks:file.storageChunks,targetGrade:grade,targetDivision:div,uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"resources",r);return json({resource:{...r,uploaderName:actor.fullName,uploaderRole:actor.role}},201);
   }
   if(idMatch&&idMatch[1]==="resources"&&method==="DELETE"){
     const id=Number(idMatch[2]),r=await get(env,"resources",id);if(!r)return err("ግብአቱ አልተገኘም።",404);if(actor.role!=="head"&&r.uploadedBy!==actor.id)return err("ይህን ግብአት ለመሰረዝ ፈቃድ የለዎትም።",403);
@@ -390,13 +526,14 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
   // Reports
   if(path==="/api/reports"&&method==="GET"){
     await purgeExpiredTable(env,"reports");
-    let rows=await enriched(env,await all(env,"reports"),"submittedBy",u=>({submitterName:u.fullName}));if(actor.role==="head"){}else if(actor.role==="dept_head"&&actor.department)rows=rows.filter(x=>x.department===actor.department);else rows=[];rows.sort(sortNewest);return json({reports:rows});
+    let rows=await enriched(env,await all(env,"reports"),"submittedBy",u=>({submitterName:u.fullName}));if(actor.role==="head"){}else if(actor.role==="dept_head"&&actor.department)rows=rows.filter(x=>x.department===actor.department);else rows=[];rows.sort(sortNewest);return json({reports:rows.map(r=>publicFileRecord(r,"report"))});
   }
   if(path==="/api/reports"&&method==="POST"){
     if(actor.role!=="dept_head"||!actor.department)return err("ሪፖርት ማቅረብ የሚችሉት የክፍል ተመዳቢ ሀላፊዎች ብቻ ናቸው።",403);
     if(!body.title||!body.content)return err("እባክዎ የሪፖርቱን ርዕስና የፅሁፍ ዝርዝር ያስገቡ።");
-    let pdfUrl=null,pdfName=null;if(body.originalFileName||body.googleDriveFileId){const f=await createStoredFile({...body,resourceType:"pdf"});if(!f||f.resourceType!=="pdf")return err("ለሪፖርት ማያያዣ የተፈቀደው PDF ፋይል ብቻ ነው።");pdfUrl=f.fileUrl;pdfName=f.fileName;}
-    const id=await nextId(env,"reports"),r={id,department:actor.department,submittedBy:actor.id,title:String(body.title).trim(),content:String(body.content).trim(),pdfUrl,pdfName,status:"pending",createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"reports",r);return json({report:{...r,submitterName:actor.fullName}},201);
+    let pdfUrl=null,pdfName=null;if(body.uploadId){const f=await createStoredFile(env,{...body,resourceType:"pdf"},actor);if(!f||f.resourceType!=="pdf")return err("ለሪፖርት ማያያዣ የተፈቀደው PDF ፋይል ብቻ ነው።");pdfUrl=f.fileUrl;pdfName=f.fileName;}
+    const reportUpload=body.uploadId?await createStoredFile(env,{...body,resourceType:"pdf"},actor):null;
+    const id=await nextId(env,"reports"),r={id,department:actor.department,submittedBy:actor.id,title:String(body.title).trim(),content:String(body.content).trim(),pdfUrl,pdfName,storageChunks:reportUpload?.storageChunks||null,status:"pending",createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"reports",r);return json({report:{...r,submitterName:actor.fullName}},201);
   }
   if(idMatch&&["reports","departments/reports"].includes(idMatch[1])&&method==="PATCH"){if(actor.role!=="head")return err("ፈቃድ የለዎትም።",403);const r=await get(env,"reports",Number(idMatch[2]));if(r){r.status=body.status==="reviewed"?"reviewed":"pending";await put(env,"reports",r);}return json({ok:true});}
   if(idMatch&&["reports","departments/reports"].includes(idMatch[1])&&method==="DELETE"){
@@ -419,14 +556,14 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
   // Department materials
   if(path==="/api/dept-materials"&&method==="GET"){
     await purgeExpiredTable(env,"materials");
-    let rows=await enriched(env,await all(env,"materials"),"uploadedBy",u=>({uploaderName:u.fullName}));if(actor.role==="head"){}else if(["dept_head","dept_member"].includes(actor.role)&&actor.department){rows=rows.filter(m=>m.department===actor.department);if(actor.role==="dept_member")rows=rows.map(m=>({...m,fileUrl:"/api/files/download?kind=material&id="+m.id}));}else rows=[];rows.sort(sortNewest);return json({materials:rows});
+    let rows=await enriched(env,await all(env,"materials"),"uploadedBy",u=>({uploaderName:u.fullName}));if(actor.role==="head"){}else if(["dept_head","dept_member"].includes(actor.role)&&actor.department)rows=rows.filter(m=>m.department===actor.department);else rows=[];rows.sort(sortNewest);return json({materials:rows.map(m=>publicFileRecord(m,"material"))});
   }
   if(path==="/api/dept-materials"&&method==="POST"){
     if(actor.role!=="dept_head"||!actor.department)return err("ለክፍል አባላት ፋይል መስጠት የሚችሉት የክፍሉ ተመዳቢ ሀላፊዎች ብቻ ናቸው።",403);
-    if(!body.title||!body.originalFileName&&!body.googleDriveFileId)return err("እባክዎ ርዕስና ፋይል ያስገቡ።");
-    const f=await createStoredFile(body);if(!f||!f.resourceType)return err("የማይታወቅ የፋይል አይነት ነው።");
+    if(!body.title||!body.uploadId)return err("እባክዎ ርዕስና ፋይል ያስገቡ።");
+    const f=await createStoredFile(env,body,actor);if(!f||!f.resourceType)return err("የማይታወቅ የፋይል አይነት ነው።");
     const dept=await get(env,"departments",actor.department),allows=dept?Boolean(dept.allowsMedia):actor.department==="choir";if(!allows&&f.resourceType!=="pdf")return err("ለዚህ ክፍል ለአባላት መስጠት የሚፈቀደው የPDF ፋይል ብቻ ነው። (ኦዲዮና ቪዲዮ ለመዝሙር ክፍል ወይም ለተፈቀደለት ክፍል ብቻ ነው)");
-    const id=await nextId(env,"materials"),m={id,department:actor.department,title:String(body.title).trim(),description:String(body.description||"").trim(),fileType:f.resourceType,fileUrl:f.fileUrl,fileName:f.fileName,uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"materials",m);return json({material:{...m,uploaderName:actor.fullName}},201);
+    const id=await nextId(env,"materials"),m={id,department:actor.department,title:String(body.title).trim(),description:String(body.description||"").trim(),fileType:f.resourceType,fileUrl:f.fileUrl,fileName:f.fileName,storageChunks:f.storageChunks,uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"materials",m);return json({material:{...m,uploaderName:actor.fullName}},201);
   }
   if(idMatch&&["dept-materials","departments/materials"].includes(idMatch[1])&&method==="DELETE"){
     const id=Number(idMatch[2]),m=await get(env,"materials",id);if(!m)return err("ፋይሉ አልተገኘም።",404);if(actor.role!=="head"&&m.uploadedBy!==actor.id)return err("ፈቃድ የለዎትም።",403);
