@@ -104,8 +104,50 @@ export interface StoredFileUploadResult {
   mimeType: string;
 }
 
-const SINGLE_UPLOAD_LIMIT = 15 * 1024 * 1024;
-const MAX_UPLOAD_LIMIT = 250 * 1024 * 1024;
+const SINGLE_UPLOAD_LIMIT = 15_000_000;
+const MAX_UPLOAD_LIMIT = 250_000_000;
+
+function uploadFormDataWithProgress(
+  url: string,
+  form: FormData,
+  onProgress: (loaded: number, total: number) => void
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url, true);
+    const token = getStoredToken();
+    if (token) xhr.setRequestHeader('Authorization', 'Bearer ' + token);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress(event.loaded, event.total);
+      }
+    };
+    xhr.onerror = () => reject(new Error('የኔትወርክ ግንኙነት ተቋርጧል። እባክዎ እንደገና ይሞክሩ።'));
+    xhr.ontimeout = () => reject(new Error('የፋይል መጫኛ ጊዜው አልፏል።'));
+    xhr.onload = () => {
+      let data: any = null;
+      try { data = xhr.responseText ? JSON.parse(xhr.responseText) : null; } catch { data = null; }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        if (typeof data?.error === 'string' && data.error.trim()) {
+          reject(new Error(data.error));
+        } else if (xhr.status === 413) {
+          reject(new Error('የመጫኛ ጥያቄው ከመጠን ገደቡ በልጧል። እስከ 250 MB ድረስ በ15 MB ቁራጮች ይጫኑ።'));
+        } else if (xhr.status === 502 || xhr.status === 504) {
+          reject(new Error('የማከማቻ አገልግሎት ጊዜው አልፏል ወይም ምላሽ አልሰጠም። እባክዎ እንደገና ይሞክሩ።'));
+        } else {
+          reject(new Error('የአገልጋይ ስህተት (HTTP ' + xhr.status + ') ተከስቷል።'));
+        }
+        return;
+      }
+      if (!data || typeof data !== 'object') {
+        reject(new Error('የአገልጋዩ ምላሽ JSON አይደለም። እባክዎ እንደገና ይሞክሩ።'));
+        return;
+      }
+      resolve(data);
+    };
+    xhr.send(form);
+  });
+}
 
 export async function uploadFileToStorage(
   file: File,
@@ -133,7 +175,9 @@ export async function uploadFileToStorage(
     form.append('mimeType', mimeType);
     form.append('file', file, file.name);
 
-    await apiFetch('/api/files/upload', { method: 'POST', body: form });
+    await uploadFormDataWithProgress('/api/files/upload', form, (loaded, total) => {
+      onProgress?.(Math.min(95, Math.round((loaded / total) * 95)));
+    });
     onProgress?.(100);
   } else {
     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
@@ -149,9 +193,8 @@ export async function uploadFileToStorage(
       form.append('mimeType', mimeType);
       form.append('file', chunk, file.name);
 
-      await apiFetch('/api/files/upload-chunk', {
-        method: 'POST',
-        body: form,
+      await uploadFormDataWithProgress('/api/files/upload-chunk', form, (loaded, total) => {
+        onProgress?.(Math.min(95, Math.round(((start + (loaded / total) * chunk.size) / file.size) * 95)));
       });
       onProgress?.(Math.min(95, Math.round((end / file.size) * 95)));
     }
