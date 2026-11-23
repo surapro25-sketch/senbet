@@ -132,7 +132,7 @@ async function purgeExpiredTable(env,table){
     const permanent=Array.isArray(row.storageChunks)&&row.storageChunks.length>0&&row.storageChunks.every(chunk=>Boolean(chunk?.telegramFileId));
     if(permanent){
       row.storageChunks=row.storageChunks.map(chunk=>({...chunk,googleDriveFileId:null}));
-      row.telegramPermanent=true;row.driveExpiredAt=Date.now();
+      row.googleDriveFileIds=[];row.telegramPermanent=true;row.driveExpiredAt=Date.now();
       await put(env,table,row);
     }else await remove(env,table,row.id);
   }));
@@ -488,7 +488,7 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
     const file=await createStoredFile(env,body,actor);if(!file)return err("እባክዎ ፋይሉን በትክክል ይጫኑና ይጨርሱ።");
     if(!file.resourceType)return err("የተፈቀዱት የፋይል አይነቶች PDF፣ Audio እና Video ብቻ ናቸው።");
     let grade=body.targetGrade?Number(body.targetGrade):null,div=body.targetDivision||"all";if(actor.role==="teacher"&&actor.assignedGrade&&!grade&&div==="all")grade=actor.assignedGrade;if(grade)div=division(grade);
-    const id=await nextId(env,"resources"),r={id,title:String(body.title).trim(),description:String(body.description||"").trim(),resourceType:file.resourceType,fileUrl:file.fileUrl,fileName:file.fileName,storageChunks:file.storageChunks,telegramPermanent:file.storageChunks.every(chunk=>Boolean(chunk?.telegramFileId)),targetGrade:grade,targetDivision:div,uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"resources",r);return json({resource:{...publicFileRecord(r,"resource"),uploaderName:actor.fullName,uploaderRole:actor.role}},201);
+    const id=await nextId(env,"resources"),r={id,title:String(body.title).trim(),description:String(body.description||"").trim(),resourceType:file.resourceType,fileUrl:file.fileUrl,fileName:file.fileName,storageChunks:file.storageChunks,googleDriveFileIds:file.storageChunks.map(chunk=>chunk.googleDriveFileId||null),telegramFileIds:file.storageChunks.map(chunk=>chunk.telegramFileId||null),telegramPermanent:file.storageChunks.every(chunk=>Boolean(chunk?.telegramFileId)),targetGrade:grade,targetDivision:div,uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"resources",r);return json({resource:{...publicFileRecord(r,"resource"),uploaderName:actor.fullName,uploaderRole:actor.role}},201);
   }
   if(idMatch&&idMatch[1]==="resources"&&method==="DELETE"){
     const id=Number(idMatch[2]),r=await get(env,"resources",id);if(!r)return err("ግብአቱ አልተገኘም።",404);if(actor.role!=="head"&&r.uploadedBy!==actor.id)return err("ይህን ግብአት ለመሰረዝ ፈቃድ የለዎትም።",403);
@@ -542,7 +542,7 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
     if(!body.title||!body.content)return err("እባክዎ የሪፖርቱን ርዕስና የፅሁፍ ዝርዝር ያስገቡ።");
     let pdfUrl=null,pdfName=null;if(body.uploadId){const f=await createStoredFile(env,{...body,resourceType:"pdf"},actor);if(!f||f.resourceType!=="pdf")return err("ለሪፖርት ማያያዣ የተፈቀደው PDF ፋይል ብቻ ነው።");pdfUrl=f.fileUrl;pdfName=f.fileName;}
     const reportUpload=body.uploadId?await createStoredFile(env,{...body,resourceType:"pdf"},actor):null;
-    const id=await nextId(env,"reports"),r={id,department:actor.department,submittedBy:actor.id,title:String(body.title).trim(),content:String(body.content).trim(),pdfUrl,pdfName,storageChunks:reportUpload?.storageChunks||null,telegramPermanent:Boolean(reportUpload?.storageChunks?.length&&reportUpload.storageChunks.every(chunk=>Boolean(chunk?.telegramFileId))),status:"pending",createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"reports",r);return json({report:{...publicFileRecord(r,"report"),submitterName:actor.fullName}},201);
+    const id=await nextId(env,"reports"),r={id,department:actor.department,submittedBy:actor.id,title:String(body.title).trim(),content:String(body.content).trim(),pdfUrl,pdfName,storageChunks:reportUpload?.storageChunks||null,googleDriveFileIds:reportUpload?.storageChunks?.map(chunk=>chunk.googleDriveFileId||null)||[],telegramFileIds:reportUpload?.storageChunks?.map(chunk=>chunk.telegramFileId||null)||[],telegramPermanent:Boolean(reportUpload?.storageChunks?.length&&reportUpload.storageChunks.every(chunk=>Boolean(chunk?.telegramFileId))),status:"pending",createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"reports",r);return json({report:{...publicFileRecord(r,"report"),submitterName:actor.fullName}},201);
   }
   if(idMatch&&["reports","departments/reports"].includes(idMatch[1])&&method==="PATCH"){if(actor.role!=="head")return err("ፈቃድ የለዎትም።",403);const r=await get(env,"reports",Number(idMatch[2]));if(r){r.status=body.status==="reviewed"?"reviewed":"pending";await put(env,"reports",r);}return json({ok:true});}
   if(idMatch&&["reports","departments/reports"].includes(idMatch[1])&&method==="DELETE"){
@@ -572,7 +572,7 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
     if(!body.title||!body.uploadId)return err("እባክዎ ርዕስና ፋይል ያስገቡ።");
     const f=await createStoredFile(env,body,actor);if(!f||!f.resourceType)return err("የማይታወቅ የፋይል አይነት ነው።");
     const dept=await get(env,"departments",actor.department),allows=dept?Boolean(dept.allowsMedia):actor.department==="choir";if(!allows&&f.resourceType!=="pdf")return err("ለዚህ ክፍል ለአባላት መስጠት የሚፈቀደው የPDF ፋይል ብቻ ነው። (ኦዲዮና ቪዲዮ ለመዝሙር ክፍል ወይም ለተፈቀደለት ክፍል ብቻ ነው)");
-    const id=await nextId(env,"materials"),m={id,department:actor.department,title:String(body.title).trim(),description:String(body.description||"").trim(),fileType:f.resourceType,fileUrl:f.fileUrl,fileName:f.fileName,storageChunks:f.storageChunks,telegramPermanent:f.storageChunks.every(chunk=>Boolean(chunk?.telegramFileId)),uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"materials",m);return json({material:{...publicFileRecord(m,"material"),uploaderName:actor.fullName}},201);
+    const id=await nextId(env,"materials"),m={id,department:actor.department,title:String(body.title).trim(),description:String(body.description||"").trim(),fileType:f.resourceType,fileUrl:f.fileUrl,fileName:f.fileName,storageChunks:f.storageChunks,googleDriveFileIds:f.storageChunks.map(chunk=>chunk.googleDriveFileId||null),telegramFileIds:f.storageChunks.map(chunk=>chunk.telegramFileId||null),telegramPermanent:f.storageChunks.every(chunk=>Boolean(chunk?.telegramFileId)),uploadedBy:actor.id,createdAt:now(),expiresAt:Date.now()+FILE_TTL_MS};await put(env,"materials",m);return json({material:{...publicFileRecord(m,"material"),uploaderName:actor.fullName}},201);
   }
   if(idMatch&&["dept-materials","departments/materials"].includes(idMatch[1])&&method==="DELETE"){
     const id=Number(idMatch[2]),m=await get(env,"materials",id);if(!m)return err("ፋይሉ አልተገኘም።",404);if(actor.role!=="head"&&m.uploadedBy!==actor.id)return err("ፈቃድ የለዎትም።",403);
