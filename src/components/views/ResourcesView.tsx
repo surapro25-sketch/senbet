@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Download, Eye, FileText, Headphones, Plus, Trash2, Upload, Video } from 'lucide-react';
 import { motion, useReducedMotion } from 'motion/react';
-import { apiFetch, getEntityDownloadUrl, uploadFileToGoogleDriveIfConfigured } from '../../utils/api';
+import { apiFetch, getEntityDownloadUrl, uploadFileToStorage } from '../../utils/api';
 import { DIVISIONS, getDivisionLabel, getGradeLabel, GRADES, ROLE_LABELS } from '../../utils/school';
 import type { DivisionId, EducationalResource, ResourceType, UserRecord } from '../../types';
 import { MediaPreviewModal } from '../MediaPreviewModal';
@@ -67,34 +67,18 @@ export function ResourcesView({ currentUser }: ResourcesViewProps) {
     setUploading(true);
     setUploadProgress(null);
     try {
-      const driveUpload = await uploadFileToGoogleDriveIfConfigured(file, setUploadProgress);
-      let res: { resource?: EducationalResource };
-
-      if (driveUpload) {
-        res = await apiFetch<{ resource?: EducationalResource }>('/api/resources', {
-          method: 'POST',
-          body: JSON.stringify({
-            title,
-            description,
-            targetDivision,
-            targetGrade: targetGrade || null,
-            ...driveUpload,
-          }),
-        });
-        setUploadProgress(100);
-      } else {
-        const formData = new FormData();
-        formData.append('title', title);
-        formData.append('description', description);
-        formData.append('targetDivision', targetDivision);
-        if (targetGrade) formData.append('targetGrade', targetGrade);
-        formData.append('file', file);
-
-        res = await apiFetch<{ resource?: EducationalResource }>('/api/resources', {
-          method: 'POST',
-          body: formData,
-        });
-      }
+      const uploadedFile = await uploadFileToStorage(file, setUploadProgress);
+      const res = await apiFetch<{ resource?: EducationalResource }>('/api/resources', {
+        method: 'POST',
+        body: JSON.stringify({
+          title,
+          description,
+          targetDivision,
+          targetGrade: targetGrade || null,
+          ...uploadedFile,
+        }),
+      });
+      setUploadProgress(100);
 
       if (res?.resource && typeof res.resource.id === 'number') {
         setResources((prev) => [
