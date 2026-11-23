@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { CheckCircle2, Download, Eye, FileText, Headphones, Send, Trash2, Upload, Video } from 'lucide-react';
 import { motion, useReducedMotion } from 'motion/react';
-import { apiFetch, getEntityDownloadUrl, uploadFileToGoogleDriveIfConfigured, type FileEntityKind } from '../../utils/api';
+import { apiFetch, getEntityDownloadUrl, uploadFileToStorage, type FileEntityKind } from '../../utils/api';
 import { DEFAULT_DEPARTMENTS, doesDepartmentAllowMedia, getDepartmentLabel, syncDepartmentsRegistry } from '../../utils/school';
 import type {
   DepartmentId,
@@ -158,30 +158,16 @@ export function DepartmentsView({ currentUser }: DepartmentsViewProps) {
     setUploadingMat(true);
     setMatUploadProgress(null);
     try {
-      const driveUpload = await uploadFileToGoogleDriveIfConfigured(matFile, setMatUploadProgress);
-      let res: { material?: DepartmentMaterial };
-
-      if (driveUpload) {
-        res = await apiFetch<{ material?: DepartmentMaterial }>('/api/dept-materials', {
-          method: 'POST',
-          body: JSON.stringify({
-            title: matTitle,
-            description: matDesc,
-            ...driveUpload,
-          }),
-        });
-        setMatUploadProgress(100);
-      } else {
-        const fd = new FormData();
-        fd.append('title', matTitle);
-        fd.append('description', matDesc);
-        fd.append('file', matFile);
-
-        res = await apiFetch<{ material?: DepartmentMaterial }>('/api/dept-materials', {
-          method: 'POST',
-          body: fd,
-        });
-      }
+      const uploadedFile = await uploadFileToStorage(matFile, setMatUploadProgress);
+      const res = await apiFetch<{ material?: DepartmentMaterial }>('/api/dept-materials', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: matTitle,
+          description: matDesc,
+          ...uploadedFile,
+        }),
+      });
+      setMatUploadProgress(100);
 
       if (res?.material && typeof res.material.id === 'number') {
         setMaterials((prev) => [
@@ -220,32 +206,18 @@ export function DepartmentsView({ currentUser }: DepartmentsViewProps) {
     setSubmittingRep(true);
     setRepUploadProgress(null);
     try {
-      const driveUpload = repPdf
-        ? await uploadFileToGoogleDriveIfConfigured(repPdf, setRepUploadProgress)
+      const uploadedFile = repPdf
+        ? await uploadFileToStorage(repPdf, setRepUploadProgress)
         : null;
-      let res: { report?: DepartmentReport };
-
-      if (driveUpload) {
-        res = await apiFetch<{ report?: DepartmentReport }>('/api/reports', {
-          method: 'POST',
-          body: JSON.stringify({
-            title: repTitle,
-            content: repContent,
-            ...driveUpload,
-          }),
-        });
-        setRepUploadProgress(100);
-      } else {
-        const fd = new FormData();
-        fd.append('title', repTitle);
-        fd.append('content', repContent);
-        if (repPdf) fd.append('pdf', repPdf);
-
-        res = await apiFetch<{ report?: DepartmentReport }>('/api/reports', {
-          method: 'POST',
-          body: fd,
-        });
-      }
+      const res = await apiFetch<{ report?: DepartmentReport }>('/api/reports', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: repTitle,
+          content: repContent,
+          ...(uploadedFile || {}),
+        }),
+      });
+      if (uploadedFile) setRepUploadProgress(100);
 
       if (res?.report && typeof res.report.id === 'number') {
         setReports((prev) => [
