@@ -206,7 +206,7 @@ async function uploadChunkCore(env,actor,body){
   const stageKey="upload:"+uploadId,stageRaw=await env.SENBET_DB.get(stageKey);let stage=null;
   try{stage=stageRaw?JSON.parse(stageRaw):null;}catch{}
   if(stage&&(stage.userId!==actor.id||stage.fileSize!==fileSize||stage.totalChunks!==totalChunks||stage.originalName!==originalName))return err("ይህ የመጫኛ መለያ ከዚህ ፋይል ጋር አይዛመድም።",409);
-  if(stage?.chunks?.[chunkIndex])return json({ok:true,chunkIndex,alreadyUploaded:true});
+  if(stage?.chunks?.[chunkIndex])return json({ok:true,chunkIndex,alreadyUploaded:true,fileId:stage.chunks[chunkIndex].telegramFileId||null});
   const bytes=new Uint8Array(await blob.arrayBuffer());
   const driveName=originalName+".part-"+String(chunkIndex+1).padStart(3,"0");
   const outcomes=await Promise.allSettled([
@@ -222,7 +222,7 @@ async function uploadChunkCore(env,actor,body){
   stage=stage||{uploadId,userId:actor.id,originalName,mimeType,fileSize,totalChunks,chunks:[],createdAt:Date.now()};
   stage.chunks[chunkIndex]={chunkIndex,byteLength:blob.size,telegramFileId,googleDriveFileId};
   await env.SENBET_DB.put(stageKey,JSON.stringify(stage),{expirationTtl:86400});
-  return json({ok:true,chunkIndex,storage:{telegram:!!telegramFileId,googleDrive:!!googleDriveFileId}});
+  return json({ok:true,chunkIndex,fileId:telegramFileId,storage:{telegram:!!telegramFileId,googleDrive:!!googleDriveFileId}});
 }
 async function finalizeUpload(env,actor,uploadId){
   const key="upload:"+String(uploadId||"").trim(),raw=await env.SENBET_DB.get(key);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
