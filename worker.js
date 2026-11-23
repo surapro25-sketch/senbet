@@ -166,8 +166,8 @@ async function uploadToGoogleDrive(env,payload){
   }
 }
 
-const UPLOAD_CHUNK_SIZE=15*1024*1024;
-const MAX_UPLOAD_SIZE=250*1024*1024;
+const UPLOAD_CHUNK_SIZE=15000000;
+const MAX_UPLOAD_SIZE=250000000;
 function preserveFileName(value){return String(value||"file").split(/[\\/]/).pop().replace(/[\r\n\0]/g,"_").trim()||"file";}
 function base64FromBytes(bytes){let binary="";for(let i=0;i<bytes.length;i+=0x8000)binary+=String.fromCharCode(...bytes.subarray(i,Math.min(i+0x8000,bytes.length)));return btoa(binary);}
 async function telegramStoreChunk(env,{blob,fileName,mimeType}){
