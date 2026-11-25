@@ -354,6 +354,8 @@ export function AccountsAdminView({ currentUser, onProfileUpdated }: AccountsAdm
                   className="glass-input mt-1 w-full px-3 py-2 text-xs"
                 >
                   <option value="teacher" className="bg-slate-900 text-white">መምህር</option>
+                  <option value="accountant" className="bg-slate-900 text-white">ሂሳብ ሹም (Accountant)</option>
+                  <option value="accountant" className="bg-slate-900 text-white">ሂሳብ ሹም (Accountant)</option>
                   <option value="dept_head" className="bg-slate-900 text-white">የክፍል ሀላፊ (ተመዳቢ)</option>
                   <option value="dept_member" className="bg-slate-900 text-white">የክፍል አባል</option>
                   <option value="student" className="bg-slate-900 text-white">ተማሪ</option>
