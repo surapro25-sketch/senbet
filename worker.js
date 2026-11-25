@@ -438,7 +438,8 @@ async function uploadChunkCore(env,actor,body,ctx){
   const stageKey="upload:"+uploadId,stageRaw=await kvGet(env,stageKey);let stage=null;
   try{stage=stageRaw?JSON.parse(stageRaw):null;}catch{}
   if(stage&&(stage.userId!==actor.id||stage.fileSize!==fileSize||stage.totalChunks!==totalChunks||stage.originalName!==originalName))return err("ይህ የመጫኛ መለያ ከዚህ ፋይል ጋር አይዛመድም።",409);
-  if(stage?.chunks?.[chunkIndex]?.telegramFileId)return json({ok:true,chunkIndex,alreadyUploaded:true,fileId:stage.chunks[chunkIndex].telegramFileId});
+  const priorRaw=await kvGet(env,stageKey+":chunk:"+chunkIndex);let prior=null;try{prior=priorRaw?JSON.parse(priorRaw):null;}catch{}
+  if(prior?.telegramFileId)return json({ok:true,chunkIndex,alreadyUploaded:true,fileId:prior.telegramFileId});
   const bytes=new Uint8Array(await blob.arrayBuffer());
   const driveName=originalName+".part-"+String(chunkIndex+1).padStart(3,"0");
   let telegramFileId;
