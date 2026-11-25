@@ -629,6 +629,7 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
     if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
     const fileName=safeName(body.fileName),mimeType=String(body.mimeType||"application/octet-stream").trim(),fileSize=Number(body.fileSize);
     if(!fileName||!Number.isSafeInteger(fileSize)||fileSize<=0)return err("የፋይል መረጃው ትክክል አይደለም።",400);
+    const validation=validateUpload(fileName,mimeType,fileSize);if(validation.error)return err(validation.error,413);
     return createGoogleDriveUploadSession(env,{fileName,mimeType,fileSize});
   }
   if(path==="/api/files/upload-chunk"&&method==="POST"){
