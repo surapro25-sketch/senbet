@@ -184,7 +184,7 @@ export async function uploadFileToStorage(
   const totalChunks = file.size > CHUNK_THRESHOLD ? Math.ceil(file.size / SINGLE_UPLOAD_LIMIT) : 1;
   onProgress?.(0, 0, file.size, 'Preparing upload');
 
-  if (totalChunks === 1) {
+  if (file.size <= CHUNK_THRESHOLD) {
     const form = new FormData();
     form.append('uploadId', uploadId);
     form.append('chunkIndex', '0');
@@ -199,7 +199,7 @@ export async function uploadFileToStorage(
     });
     onProgress?.(100, file.size, file.size, 'Upload complete');
   } else {
-    let completedBytes = 0;
+    const chunkProgress = new Array<number>(totalChunks).fill(0);
     let nextChunk = 0;
     const workers = Array.from({ length: Math.min(3, totalChunks) }, async () => {
       while (true) {
@@ -208,6 +208,7 @@ export async function uploadFileToStorage(
       const start = chunkIndex * SINGLE_UPLOAD_LIMIT;
       const end = Math.min(start + SINGLE_UPLOAD_LIMIT, file.size);
       const chunk = file.slice(start, end, mimeType);
+      const chunkSize = chunk.size;
       const form = new FormData();
       form.append('uploadId', uploadId);
       form.append('chunkIndex', String(chunkIndex));
@@ -221,7 +222,9 @@ export async function uploadFileToStorage(
       for (let attempt = 0; attempt < 3; attempt += 1) {
         try {
           await uploadFormDataWithProgress('/api/files/upload-chunk', form, (loaded) => {
-            onProgress?.(Math.min(95, Math.round(((completedBytes + loaded) / file.size) * 95)), completedBytes + loaded, file.size, `Uploading part ${chunkIndex + 1}/${totalChunks}`);
+            chunkProgress[chunkIndex] = Math.min(chunkSize, loaded);
+            const transferred = chunkProgress.reduce((sum, value) => sum + value, 0);
+            onProgress?.(Math.min(95, Math.round((transferred / file.size) * 95)), transferred, file.size, `Uploading part ${chunkIndex + 1}/${totalChunks}`);
           });
           lastError = null;
           break;
@@ -231,8 +234,9 @@ export async function uploadFileToStorage(
         }
       }
       if (lastError) throw lastError;
-      completedBytes += chunk.size;
-      onProgress?.(Math.min(95, Math.round((completedBytes / file.size) * 95)), completedBytes, file.size, `Uploaded part ${chunkIndex + 1}/${totalChunks}`);
+      chunkProgress[chunkIndex] = chunk.size;
+      const transferred = chunkProgress.reduce((sum, value) => sum + value, 0);
+      onProgress?.(Math.min(95, Math.round((transferred / file.size) * 95)), transferred, file.size, `Uploaded part ${chunkIndex + 1}/${totalChunks}`);
       }
     });
     await Promise.all(workers);
