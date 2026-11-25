@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Download, Eye, FileText, Headphones, Plus, Trash2, Upload, Video } from 'lucide-react';
 import { motion, useReducedMotion } from 'motion/react';
-import { apiFetch, getEntityDownloadUrl, uploadFileToStorage } from '../../utils/api';
+import { apiFetch, getEntityDownloadUrl, uploadFileToStorage, validateUploadFile } from '../../utils/api';
 import { DIVISIONS, getDivisionLabel, getGradeLabel, GRADES, ROLE_LABELS } from '../../utils/school';
 import type { DivisionId, EducationalResource, ResourceType, UserRecord } from '../../types';
 import { MediaPreviewModal } from '../MediaPreviewModal';
@@ -29,6 +29,8 @@ export function ResourcesView({ currentUser }: ResourcesViewProps) {
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadStatus, setUploadStatus] = useState('');
+  const [uploadedBytes, setUploadedBytes] = useState(0);
   const [error, setError] = useState('');
 
   // Preview modal
@@ -64,10 +66,14 @@ export function ResourcesView({ currentUser }: ResourcesViewProps) {
       return;
     }
 
+    const validationError = validateUploadFile(file);
+    if (validationError) { setError(validationError); return; }
     setUploading(true);
-    setUploadProgress(null);
+    setUploadProgress(0);
+    setUploadedBytes(0);
+    setUploadStatus('Preparing upload');
     try {
-      const uploadedFile = await uploadFileToStorage(file, setUploadProgress);
+      const uploadedFile = await uploadFileToStorage(file, (percent, loaded, total, status) => { setUploadProgress(percent); setUploadedBytes(loaded || 0); setUploadStatus(status || 'Uploading'); });
       const res = await apiFetch<{ resource?: EducationalResource }>('/api/resources', {
         method: 'POST',
         body: JSON.stringify({
@@ -97,6 +103,7 @@ export function ResourcesView({ currentUser }: ResourcesViewProps) {
     } finally {
       setUploading(false);
       setUploadProgress(null);
+      setUploadStatus('');
     }
   }
 
@@ -175,7 +182,7 @@ export function ResourcesView({ currentUser }: ResourcesViewProps) {
                 type="file"
                 required
                 accept=".pdf,audio/*,video/*"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
+                onChange={(e) => { const selected = e.target.files?.[0] || null; setFile(selected); setError(selected ? validateUploadFile(selected) || '' : ''); setUploadProgress(null); setUploadedBytes(0); setUploadStatus(''); }}
                 className="glass-input mt-1.5 block w-full px-3 py-1.5 text-xs file:mr-3 file:rounded-lg file:border-0 file:bg-white file:px-3 file:py-1 file:text-xs file:font-semibold file:text-zinc-950"
               />
             </div>
@@ -234,7 +241,7 @@ export function ResourcesView({ currentUser }: ResourcesViewProps) {
           {uploading && uploadProgress !== null && (
             <div className="space-y-1.5">
               <div className="flex items-center justify-between text-xs text-white/85">
-                <span>ፋይሉን በመጫን ላይ...</span>
+                <span>{uploadStatus || 'ፋይሉን በመጫን ላይ...'} · {(uploadedBytes / 1000000).toFixed(1)} / {file ? (file.size / 1000000).toFixed(1) : '0.0'} MB</span>
                 <span className="font-mono font-semibold tabular-nums">{uploadProgress}%</span>
               </div>
               <div className="h-2 w-full overflow-hidden rounded-full bg-white/15">
