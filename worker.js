@@ -70,7 +70,7 @@ const DDL = [
   "CREATE TABLE IF NOT EXISTS senbet_records (table_name VARCHAR(64) NOT NULL, record_id VARCHAR(191) NOT NULL, created_at DATETIME NULL, payload LONGTEXT NOT NULL, PRIMARY KEY (table_name, record_id), KEY idx_srec_record_id (record_id), KEY idx_srec_created_at (created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
   "CREATE TABLE IF NOT EXISTS senbet_kv (key_name VARCHAR(512) NOT NULL PRIMARY KEY, value LONGTEXT NULL, expires_at BIGINT NULL, KEY idx_skv_expires_at (expires_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
   "CREATE TABLE IF NOT EXISTS senbet_migrations (migration_key VARCHAR(64) NOT NULL PRIMARY KEY, cursor_value LONGTEXT NULL, completed TINYINT NOT NULL DEFAULT 0, processed_count BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-  "CREATE TABLE IF NOT EXISTS senbet_finance_transactions (id VARCHAR(64) NOT NULL PRIMARY KEY, type VARCHAR(16) NOT NULL, category VARCHAR(64) NOT NULL, amount DECIMAL(14,2) NOT NULL, description TEXT NULL, party_name VARCHAR(191) NULL, member_id VARCHAR(191) NULL, transaction_date DATE NOT NULL, recorded_by VARCHAR(191) NOT NULL, receipt_upload_id VARCHAR(80) NULL, receipt_file_name VARCHAR(255) NULL, receipt_chunks LONGTEXT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_sft_date (transaction_date), KEY idx_sft_type (type), KEY idx_sft_category (category), KEY idx_sft_member (member_id), KEY idx_sft_date_type (transaction_date,type)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+  "CREATE TABLE IF NOT EXISTS senbet_finance_transactions (id VARCHAR(64) NOT NULL PRIMARY KEY, type VARCHAR(16) NOT NULL, category VARCHAR(64) NOT NULL, amount DECIMAL(14,2) NOT NULL, description TEXT NULL, party_name VARCHAR(191) NULL, member_id VARCHAR(191) NULL, transaction_date DATE NOT NULL, recorded_by VARCHAR(191) NOT NULL, receipt_upload_id VARCHAR(80) NULL, receipt_file_name VARCHAR(255) NULL, receipt_mime_type VARCHAR(127) NULL, receipt_chunks LONGTEXT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_sft_date (transaction_date), KEY idx_sft_type (type), KEY idx_sft_category (category), KEY idx_sft_member (member_id), KEY idx_sft_date_type (transaction_date,type)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
   "CREATE TABLE IF NOT EXISTS senbet_member_contributions (member_id VARCHAR(191) NOT NULL, contribution_month CHAR(7) NOT NULL, status VARCHAR(16) NOT NULL DEFAULT 'unpaid', amount DECIMAL(14,2) NOT NULL DEFAULT 0, transaction_id VARCHAR(64) NULL, recorded_by VARCHAR(191) NULL, paid_at DATE NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (member_id,contribution_month), KEY idx_smc_month_status (contribution_month,status), KEY idx_smc_member (member_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
 ];
 async function ensureSchema(env) {
@@ -276,7 +276,7 @@ async function enriched(env,rows,foreign,extra){const out=[];for(const r of rows
 async function getFile(env,kind,id){
   if(kind==="finance"){
     const row=await financeTransactionById(env,String(id),true);
-    return row?.receiptChunks?.length?{fileUrl:"",fileName:row.receiptFileName||"receipt",storageChunks:row.receiptChunks}:null;
+    return row?.receiptChunks?.length?{fileUrl:"",fileName:row.receiptFileName||"receipt",storageChunks:row.receiptChunks,mimeType:row.receiptMimeType}:null;
   }
   const table=kind==="resource"?"resources":kind==="material"?"materials":kind==="report"?"reports":null;
   const row=table?await get(env,table,Number(id)):null;if(!row)return null;
@@ -533,7 +533,7 @@ async function storedFileResponse(env,target,type,filename){
       catch(error){controller.error(error);}
     }
   });
-  return new Response(stream,{status:200,headers:{"content-type":mimeFor(filename),"content-disposition":disposition(type,filename),"cache-control":"private, no-store","x-content-type-options":"nosniff"}});
+  return new Response(stream,{status:200,headers:{"content-type":target.mimeType||mimeFor(filename),"content-disposition":disposition(type,filename),"cache-control":"private, no-store","x-content-type-options":"nosniff"}});
 }
 function publicFileRecord(row,kind){
   const {storageChunks,telegramFileIds,googleDriveFileIds,googleDriveFileId,...safe}=row;
@@ -596,7 +596,7 @@ async function financeAccess(actor,write=false){
   return null;
 }
 function financeTransactionRow(row,includeReceipt=false){
-  const result={...row,amount:Number(row.amount||0),memberId:row.member_id||null,partyName:row.party_name||"",transactionDate:String(row.transaction_date||"").slice(0,10),recordedBy:row.recorded_by,receiptUploadId:row.receipt_upload_id||null,receiptFileName:row.receipt_file_name||null};
+  const result={...row,amount:Number(row.amount||0),memberId:row.member_id||null,partyName:row.party_name||"",transactionDate:String(row.transaction_date||"").slice(0,10),recordedBy:row.recorded_by,receiptUploadId:row.receipt_upload_id||null,receiptFileName:row.receipt_file_name||null,receiptMimeType:row.receipt_mime_type||null};
   if(includeReceipt)result.receiptChunks=parsePayload(row.receipt_chunks)||[];
   else delete result.receipt_chunks;
   return result;
@@ -606,10 +606,10 @@ async function financeTransactionById(env,id,includeReceipt=false){
   return rows[0]?financeTransactionRow(rows[0],includeReceipt):null;
 }
 async function financeReceipt(env,uploadId,actor){
-  if(!uploadId)return {uploadId:null,fileName:null,chunks:null};
+  if(!uploadId)return {uploadId:null,fileName:null,mimeType:null,chunks:null};
   const raw=await kvGet(env,"upload:"+uploadId);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
   if(!stage||!stage.finalized||stage.userId!==actor.id)return null;
-  return {uploadId,fileName:preserveFileName(stage.originalName),chunks:JSON.stringify(stage.chunks||[])};
+  return {uploadId,fileName:preserveFileName(stage.originalName),mimeType:stage.mimeType||mimeFor(stage.originalName),chunks:JSON.stringify(stage.chunks||[])};
 }
 async function financeList(env,query){
   const where=[],params=[];
@@ -646,7 +646,7 @@ async function handleFinance(request,env,actor,body){
     if(!["income","expense"].includes(type)||!categories.includes(category)||!Number.isFinite(amount)||amount<=0||amount>999999999999||!/^\d{4}-\d{2}-\d{2}$/.test(date))return err("የገቢ/ወጪ መረጃውን በትክክል ያስገቡ።",400);
     const receipt=await financeReceipt(env,String(body.receiptUploadId||""),actor);if(!receipt)return err("የደረሰኙ ፋይል አልተገኘም፤ እባክዎ እንደገና ይጫኑ።",400);
     const id=crypto.randomUUID().replace(/-/g,"");
-    await sql(env,"INSERT INTO senbet_finance_transactions (id,type,category,amount,description,party_name,member_id,transaction_date,recorded_by,receipt_upload_id,receipt_file_name,receipt_chunks) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",[id,type,category,amount,String(body.description||"").trim(),String(body.partyName||"").trim(),body.memberId?String(body.memberId):null,date,String(actor.id),receipt.uploadId,receipt.fileName,receipt.chunks]);
+    await sql(env,"INSERT INTO senbet_finance_transactions (id,type,category,amount,description,party_name,member_id,transaction_date,recorded_by,receipt_upload_id,receipt_file_name,receipt_mime_type,receipt_chunks) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",[id,type,category,amount,String(body.description||"").trim(),String(body.partyName||"").trim(),body.memberId?String(body.memberId):null,date,String(actor.id),receipt.uploadId,receipt.fileName,receipt.mimeType,receipt.chunks]);
     return json({transaction:await financeTransactionById(env,id)},201);
   }
   if(transactionMatch&&method==="PATCH"){
@@ -654,9 +654,9 @@ async function handleFinance(request,env,actor,body){
     const id=transactionMatch[1],old=await financeTransactionById(env,id,true);if(!old)return err("የሂሳብ መዝገቡ አልተገኘም።",404);
     const type=body.type??old.type,category=String(body.category??old.category),amount=Number(body.amount??old.amount),date=String(body.transactionDate??old.transactionDate);
     if(!["income","expense"].includes(type)||!["monthly_contribution","donation","event_income","materials","other"].includes(category)||!Number.isFinite(amount)||amount<=0||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(date))return err("የገቢ/ወጪ መረጃውን በትክክል ያስገቡ።",400);
-    const receipt=body.receiptUploadId?await financeReceipt(env,String(body.receiptUploadId),actor):{uploadId:old.receiptUploadId,fileName:old.receiptFileName,chunks:old.receiptChunks?JSON.stringify(old.receiptChunks):null};
+    const receipt=body.receiptUploadId?await financeReceipt(env,String(body.receiptUploadId),actor):{uploadId:old.receiptUploadId,fileName:old.receiptFileName,mimeType:old.receiptMimeType,chunks:old.receiptChunks?JSON.stringify(old.receiptChunks):null};
     if(!receipt)return err("የደረሰኙ ፋይል አልተገኘም።",400);
-    await sql(env,"UPDATE senbet_finance_transactions SET type=?,category=?,amount=?,description=?,party_name=?,member_id=?,transaction_date=?,receipt_upload_id=?,receipt_file_name=?,receipt_chunks=? WHERE id=?",[type,category,amount,String(body.description??old.description??"").trim(),String(body.partyName??old.partyName??"").trim(),body.memberId?String(body.memberId):null,date,receipt.uploadId,receipt.fileName,receipt.chunks,id]);
+    await sql(env,"UPDATE senbet_finance_transactions SET type=?,category=?,amount=?,description=?,party_name=?,member_id=?,transaction_date=?,receipt_upload_id=?,receipt_file_name=?,receipt_mime_type=?,receipt_chunks=? WHERE id=?",[type,category,amount,String(body.description??old.description??"").trim(),String(body.partyName??old.partyName??"").trim(),body.memberId?String(body.memberId):null,date,receipt.uploadId,receipt.fileName,receipt.mimeType,receipt.chunks,id]);
     return json({transaction:await financeTransactionById(env,id)});
   }
   if(transactionMatch&&method==="DELETE"){
