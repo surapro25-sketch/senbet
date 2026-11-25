@@ -66,6 +66,7 @@ export const ROLE_LABELS: Record<UserRole, string> = {
   student: 'ተማሪ',
   dept_head: 'የክፍል ሀላፊ (ተመዳቢ)',
   dept_member: 'የክፍል አባል',
+  accountant: 'ሂሳብ ሹም',
 };
 
 export const ATTENDANCE_LABELS: Record<AttendanceStatus, string> = {
