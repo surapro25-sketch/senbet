@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   BarChart3,
+  Banknote,
   BookOpen,
   Briefcase,
   ChevronLeft,
@@ -30,6 +31,7 @@ import { AccountsAdminView } from './views/AccountsAdminView';
 import { DepartmentsView } from './views/DepartmentsView';
 import { MessagesView } from './views/MessagesView';
 import { ProfileView } from './views/ProfileView';
+import { FinanceView } from './views/FinanceView';
 
 export type WorkspaceTabId =
   | 'stats'
@@ -38,7 +40,8 @@ export type WorkspaceTabId =
   | 'accounts'
   | 'departments'
   | 'messages'
-  | 'profile';
+  | 'profile'
+  | 'finance';
 
 interface NavItem {
   id: WorkspaceTabId;
@@ -52,11 +55,19 @@ function getNavItems(user: UserRecord): NavItem[] {
   if (user.role === 'head') {
     return [
       { id: 'stats', label: 'ዳሽቦርድ (ስታቲስቲክስ)', shortLabel: 'ዳሽቦርድ', group: 'main', icon: BarChart3 },
+      { id: 'finance', label: 'ሂሳብ (ፋይናንስ)', shortLabel: 'ሂሳብ', group: 'main', icon: Banknote },
       { id: 'accounts', label: 'መለያዎችና የክፍል ምደባ', shortLabel: 'መለያዎች', group: 'main', icon: Users },
       { id: 'exams', label: 'ውጤትና አቴንዳንስ', shortLabel: 'ውጤት', group: 'main', icon: ClipboardCheck },
       { id: 'resources', label: 'የትምህርት ግብአቶች', shortLabel: 'ግብአቶች', group: 'main', icon: BookOpen },
       { id: 'departments', label: 'የስራ ክፍሎች (ሪፖርት/ትዕዛዝ)', shortLabel: 'ክፍሎች', group: 'workspace', icon: Briefcase },
       { id: 'messages', label: 'የክፍላት መልእክቶች', shortLabel: 'መልእክት', group: 'workspace', icon: MessageSquare },
+      { id: 'profile', label: 'የግል መገለጫ', shortLabel: 'መገለጫ', group: 'workspace', icon: User },
+    ];
+  }
+
+  if (user.role === 'accountant') {
+    return [
+      { id: 'finance', label: 'ሂሳብ (የገቢና ወጪ አስተዳደር)', shortLabel: 'ሂሳብ', group: 'main', icon: Banknote },
       { id: 'profile', label: 'የግል መገለጫ', shortLabel: 'መገለጫ', group: 'workspace', icon: User },
     ];
   }
@@ -598,6 +609,7 @@ export function WorkspaceLayout({
                 className="flex-1"
               >
                 {activeTab === 'stats' && currentUser.role === 'head' && <AdminStatsView />}
+                {activeTab === 'finance' && (currentUser.role === 'head' || currentUser.role === 'accountant') && <FinanceView currentUser={currentUser} />}
                 {activeTab === 'resources' && <ResourcesView currentUser={currentUser} />}
                 {activeTab === 'exams' && <ExamsAttendanceView currentUser={currentUser} />}
                 {activeTab === 'accounts' && (
