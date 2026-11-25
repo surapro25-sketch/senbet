@@ -49,7 +49,7 @@ export async function apiFetch<T = any>(
       throw new Error(data.error);
     }
     if (res.status === 413) {
-      throw new Error('የፋይል መጠኑ ከመጫኛ ገደቡ በልጧል። እስከ 250 MB ድረስ ይጫኑ።');
+      throw new Error('የፋይሉ መጠን ለፋይሉ አይነት ከተፈቀደው ገደብ በልጧል።');
     }
     if (res.status === 502 || res.status === 504) {
       throw new Error('የአገልጋይ ግንኙነት ጊዜው አልፏል ወይም ተቋርጧል። እባክዎ እንደገና ይሞክሩ።');
@@ -151,7 +151,7 @@ function uploadFormDataWithProgress(
         if (typeof data?.error === 'string' && data.error.trim()) {
           reject(new Error(data.error));
         } else if (xhr.status === 413) {
-          reject(new Error('የመጫኛ ጥያቄው ከመጠን ገደቡ በልጧል። እስከ 250 MB ድረስ በ15 MB ቁራጮች ይጫኑ።'));
+          reject(new Error('የፋይሉ መጠን ለፋይሉ አይነት ከተፈቀደው ገደብ በልጧል።'));
         } else if (xhr.status === 502 || xhr.status === 504) {
           reject(new Error('የማከማቻ አገልግሎት ጊዜው አልፏል ወይም ምላሽ አልሰጠም። እባክዎ እንደገና ይሞክሩ።'));
         } else {
