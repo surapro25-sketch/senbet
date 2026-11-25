@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { CheckCircle2, Download, Eye, FileText, Headphones, Send, Trash2, Upload, Video } from 'lucide-react';
 import { motion, useReducedMotion } from 'motion/react';
-import { apiFetch, getEntityDownloadUrl, uploadFileToStorage, type FileEntityKind } from '../../utils/api';
+import { apiFetch, getEntityDownloadUrl, uploadFileToStorage, validateUploadFile, type FileEntityKind } from '../../utils/api';
 import { DEFAULT_DEPARTMENTS, doesDepartmentAllowMedia, getDepartmentLabel, syncDepartmentsRegistry } from '../../utils/school';
 import type {
   DepartmentId,
@@ -150,6 +150,7 @@ export function DepartmentsView({ currentUser }: DepartmentsViewProps) {
     e.preventDefault();
     setErrorMsg('');
     setStatusMsg('');
+    if (matFile && validateUploadFile(matFile)) { setErrorMsg(validateUploadFile(matFile)!); return; }
     if (!matFile) {
       setErrorMsg('እባክዎ ፋይል ይምረጡ።');
       return;
@@ -203,6 +204,7 @@ export function DepartmentsView({ currentUser }: DepartmentsViewProps) {
     setErrorMsg('');
     setStatusMsg('');
 
+    if (repPdf && validateUploadFile(repPdf)) { setErrorMsg(validateUploadFile(repPdf)!); return; }
     setSubmittingRep(true);
     setRepUploadProgress(null);
     try {
@@ -355,7 +357,7 @@ export function DepartmentsView({ currentUser }: DepartmentsViewProps) {
                   <input
                     type="file"
                     accept=".pdf,application/pdf"
-                    onChange={(e) => setRepPdf(e.target.files?.[0] || null)}
+                    onChange={(e) => { const selected = e.target.files?.[0] || null; setRepPdf(selected); setErrorMsg(selected ? validateUploadFile(selected) || '' : ''); }}
                     className="glass-input mt-1 block w-full px-3 py-1.5 text-xs text-white/85 file:mr-3 file:rounded-lg file:border-0 file:bg-white file:px-3 file:py-1 file:text-xs file:font-semibold file:text-zinc-950"
                   />
                 </div>
@@ -665,7 +667,7 @@ export function DepartmentsView({ currentUser }: DepartmentsViewProps) {
                     type="file"
                     required
                     accept={isChoirHead ? '.pdf,audio/*,video/*' : '.pdf,application/pdf'}
-                    onChange={(e) => setMatFile(e.target.files?.[0] || null)}
+                    onChange={(e) => { const selected = e.target.files?.[0] || null; setMatFile(selected); setErrorMsg(selected ? validateUploadFile(selected) || '' : ''); }}
                     className="glass-input mt-1 block w-full px-3 py-1.5 text-xs text-white/85 file:mr-3 file:rounded-lg file:border-0 file:bg-white file:px-3 file:py-1 file:text-xs file:font-semibold file:text-zinc-950"
                   />
                 </div>
