@@ -532,6 +532,7 @@ export function AccountsAdminView({ currentUser, onProfileUpdated }: AccountsAdm
                 ['teacher', 'መምህራን'],
                 ['dept_head', 'የክፍል ሀላፊዎች'],
                 ['dept_member', 'የክፍል አባላት'],
+                ['accountant', 'ሂሳብ ሹሞች'],
               ] as const
             ).map(([key, label]) => (
               <button
