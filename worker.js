@@ -275,7 +275,7 @@ async function withUser(env,row,field){const u=await get(env,"users",row[field])
 async function enriched(env,rows,foreign,extra){const out=[];for(const r of rows){const u=await get(env,"users",r[foreign]);out.push({...r,...(u?extra(u):{})});}return out;}
 async function getFile(env,kind,id){
   if(kind==="finance"){
-    const row=await financeTransactionById(env,String(id));
+    const row=await financeTransactionById(env,String(id),true);
     return row?.receiptChunks?.length?{fileUrl:"",fileName:row.receiptFileName||"receipt",storageChunks:row.receiptChunks}:null;
   }
   const table=kind==="resource"?"resources":kind==="material"?"materials":kind==="report"?"reports":null;
@@ -595,12 +595,15 @@ async function financeAccess(actor,write=false){
   if(write&&actor.role!=="accountant")return err("የሂሳብ መዝገብ ለመቀየር የሂሳብ ሹም ፈቃድ ያስፈልጋል።",403);
   return null;
 }
-function financeTransactionRow(row){
-  return {...row,amount:Number(row.amount||0),memberId:row.member_id||null,partyName:row.party_name||"",transactionDate:String(row.transaction_date||"").slice(0,10),recordedBy:row.recorded_by,receiptUploadId:row.receipt_upload_id||null,receiptFileName:row.receipt_file_name||null,receiptChunks:parsePayload(row.receipt_chunks)||[]};
+function financeTransactionRow(row,includeReceipt=false){
+  const result={...row,amount:Number(row.amount||0),memberId:row.member_id||null,partyName:row.party_name||"",transactionDate:String(row.transaction_date||"").slice(0,10),recordedBy:row.recorded_by,receiptUploadId:row.receipt_upload_id||null,receiptFileName:row.receipt_file_name||null};
+  if(includeReceipt)result.receiptChunks=parsePayload(row.receipt_chunks)||[];
+  else delete result.receipt_chunks;
+  return result;
 }
-async function financeTransactionById(env,id){
+async function financeTransactionById(env,id,includeReceipt=false){
   const rows=await sql(env,"SELECT * FROM senbet_finance_transactions WHERE id = ? LIMIT 1",[id]);
-  return rows[0]?financeTransactionRow(rows[0]):null;
+  return rows[0]?financeTransactionRow(rows[0],includeReceipt):null;
 }
 async function financeReceipt(env,uploadId,actor){
   if(!uploadId)return {uploadId:null,fileName:null,chunks:null};
@@ -648,7 +651,7 @@ async function handleFinance(request,env,actor,body){
   }
   if(transactionMatch&&method==="PATCH"){
     const writeDenied=await financeAccess(actor,true);if(writeDenied)return writeDenied;
-    const id=transactionMatch[1],old=await financeTransactionById(env,id);if(!old)return err("የሂሳብ መዝገቡ አልተገኘም።",404);
+    const id=transactionMatch[1],old=await financeTransactionById(env,id,true);if(!old)return err("የሂሳብ መዝገቡ አልተገኘም።",404);
     const type=body.type??old.type,category=String(body.category??old.category),amount=Number(body.amount??old.amount),date=String(body.transactionDate??old.transactionDate);
     if(!["income","expense"].includes(type)||!["monthly_contribution","donation","event_income","materials","other"].includes(category)||!Number.isFinite(amount)||amount<=0||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(date))return err("የገቢ/ወጪ መረጃውን በትክክል ያስገቡ።",400);
     const receipt=body.receiptUploadId?await financeReceipt(env,String(body.receiptUploadId),actor):{uploadId:old.receiptUploadId,fileName:old.receiptFileName,chunks:old.receiptChunks?JSON.stringify(old.receiptChunks):null};
@@ -679,7 +682,7 @@ async function handleFinance(request,env,actor,body){
     }else if(transactionId){
       await sql(env,"DELETE FROM senbet_finance_transactions WHERE id=?",[transactionId]);transactionId=null;
     }
-    await sql(env,"INSERT INTO senbet_member_contributions (member_id,contribution_month,status,amount,transaction_id,recorded_by,paid_at) VALUES (?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE status=VALUES(status),amount=VALUES(amount),transaction_id=VALUES(transaction_id),recorded_by=VALUES(recorded_by),paid_at=VALUES(paid_at)",[memberId,month,status,amount,transactionId,String(actor.id),status==="paid"?month+"-01":null]);
+    await sql(env,"INSERT INTO senbet_member_contributions (member_id,contribution_month,status,amount,transaction_id,recorded_by,paid_at) VALUES (?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE status=VALUES(status),amount=VALUES(amount),transaction_id=VALUES(transaction_id),recorded_by=VALUES(recorded_by),paid_at=VALUES(paid_at)",[memberId,month,status,amount,transactionId,String(actor.id),status==="paid"?now().slice(0,10):null]);
     return json({ok:true,memberId:Number(memberId),month,status,amount,transactionId});
   }
   return null;
