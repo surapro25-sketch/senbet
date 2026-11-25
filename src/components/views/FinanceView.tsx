@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { apiFetch, uploadFileToStorage } from '../../utils/api';
 import type { UserRecord } from '../../types';
-import { Banknote, Download, FileText, Pencil, Plus, Printer, Search, Trash2, TrendingDown, TrendingUp, Wallet, X } from 'lucide-react';
+import { Download, Pencil, Plus, Printer, Search, Trash2, TrendingDown, TrendingUp, Wallet, X } from 'lucide-react';
 
 type FinanceType = 'income' | 'expense';
 type FinanceCategory = 'monthly_contribution' | 'donation' | 'event_income' | 'materials' | 'other';
