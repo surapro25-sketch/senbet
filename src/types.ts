@@ -1,4 +1,4 @@
-export type UserRole = 'head' | 'teacher' | 'student' | 'dept_head' | 'dept_member';
+export type UserRole = 'head' | 'teacher' | 'student' | 'dept_head' | 'dept_member' | 'accountant';
 
 export type DepartmentId = string;
 
