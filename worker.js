@@ -568,6 +568,10 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
   await ensureSchema(env);
   try { await migrateKvBatch(env, 1000); } catch (migrationError) { console.error("SENBET KV migration batch failed; continuing with dual-read/dual-write compatibility", migrationError); }
   await ensureSeed(env);
+  if(path==="/api/public/tidb-migration"&&method==="GET"){
+    const state=await migrationStatus(env);
+    return json({database:state.database,complete:state.complete,processedCount:state.processedCount});
+  }
   if(path==="/api/files/download"&&method==="GET")return fileResponse(request,env,"download");
   if(path==="/api/files/preview"&&method==="GET")return fileResponse(request,env,"preview");
   if(path==="/api/public/overview"&&method==="GET"){
