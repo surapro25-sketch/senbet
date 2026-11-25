@@ -199,7 +199,12 @@ export async function uploadFileToStorage(
     });
     onProgress?.(100, file.size, file.size, 'Upload complete');
   } else {
-    let completedBytes = 0;\n    let nextChunk = 0;\n    const workers = Array.from({ length: Math.min(3, totalChunks) }, async () => {\n      while (true) {\n        const chunkIndex = nextChunk++;\n        if (chunkIndex >= totalChunks) return;
+    let completedBytes = 0;
+    let nextChunk = 0;
+    const workers = Array.from({ length: Math.min(3, totalChunks) }, async () => {
+      while (true) {
+        const chunkIndex = nextChunk++;
+        if (chunkIndex >= totalChunks) return;
       const start = chunkIndex * SINGLE_UPLOAD_LIMIT;
       const end = Math.min(start + SINGLE_UPLOAD_LIMIT, file.size);
       const chunk = file.slice(start, end, mimeType);
