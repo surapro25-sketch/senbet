@@ -620,7 +620,7 @@ async function financeList(env,query){
   if(category&&/^[a-z_]{2,64}$/.test(category)){where.push("category = ?");params.push(category);}
   const rows=await sql(env,"SELECT * FROM senbet_finance_transactions"+(where.length?" WHERE "+where.join(" AND "):"")+" ORDER BY transaction_date DESC, created_at DESC LIMIT 2000",params);
   const totals=await sql(env,"SELECT COALESCE(SUM(CASE WHEN type='income' THEN amount ELSE 0 END),0) AS total_income, COALESCE(SUM(CASE WHEN type='expense' THEN amount ELSE 0 END),0) AS total_expenses FROM senbet_finance_transactions");
-  return {transactions:rows.map(financeTransactionRow),summary:{totalIncome:Number(totals[0]?.total_income||0),totalExpenses:Number(totals[0]?.total_expenses||0),balance:Number(totals[0]?.total_income||0)-Number(totals[0]?.total_expenses||0)}};
+  return {transactions:rows.map(row=>financeTransactionRow(row)),summary:{totalIncome:Number(totals[0]?.total_income||0),totalExpenses:Number(totals[0]?.total_expenses||0),balance:Number(totals[0]?.total_income||0)-Number(totals[0]?.total_expenses||0)}};
 }
 async function financeContributionList(env,month){
   const rows=await sql(env,"SELECT member_id, contribution_month, status, amount, transaction_id, paid_at FROM senbet_member_contributions WHERE contribution_month = ?",[month]);
@@ -644,6 +644,7 @@ async function handleFinance(request,env,actor,body){
     const categories=["monthly_contribution","donation","event_income","materials","other"];
     const amount=Number(body.amount),date=String(body.transactionDate||"");
     if(!["income","expense"].includes(type)||!categories.includes(category)||!Number.isFinite(amount)||amount<=0||amount>999999999999||!/^\d{4}-\d{2}-\d{2}$/.test(date))return err("የገቢ/ወጪ መረጃውን በትክክል ያስገቡ።",400);
+    if(body.memberId){const member=await get(env,"users",Number(body.memberId));if(!member||!["student","dept_member"].includes(member.role))return err("የተመረጠው አባል አልተገኘም።",400);}
     const receipt=await financeReceipt(env,String(body.receiptUploadId||""),actor);if(!receipt)return err("የደረሰኙ ፋይል አልተገኘም፤ እባክዎ እንደገና ይጫኑ።",400);
     const id=crypto.randomUUID().replace(/-/g,"");
     await sql(env,"INSERT INTO senbet_finance_transactions (id,type,category,amount,description,party_name,member_id,transaction_date,recorded_by,receipt_upload_id,receipt_file_name,receipt_mime_type,receipt_chunks) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",[id,type,category,amount,String(body.description||"").trim(),String(body.partyName||"").trim(),body.memberId?String(body.memberId):null,date,String(actor.id),receipt.uploadId,receipt.fileName,receipt.mimeType,receipt.chunks]);
@@ -654,6 +655,7 @@ async function handleFinance(request,env,actor,body){
     const id=transactionMatch[1],old=await financeTransactionById(env,id,true);if(!old)return err("የሂሳብ መዝገቡ አልተገኘም።",404);
     const type=body.type??old.type,category=String(body.category??old.category),amount=Number(body.amount??old.amount),date=String(body.transactionDate??old.transactionDate);
     if(!["income","expense"].includes(type)||!["monthly_contribution","donation","event_income","materials","other"].includes(category)||!Number.isFinite(amount)||amount<=0||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(date))return err("የገቢ/ወጪ መረጃውን በትክክል ያስገቡ።",400);
+    if(body.memberId){const member=await get(env,"users",Number(body.memberId));if(!member||!["student","dept_member"].includes(member.role))return err("የተመረጠው አባል አልተገኘም።",400);}
     const receipt=body.receiptUploadId?await financeReceipt(env,String(body.receiptUploadId),actor):{uploadId:old.receiptUploadId,fileName:old.receiptFileName,mimeType:old.receiptMimeType,chunks:old.receiptChunks?JSON.stringify(old.receiptChunks):null};
     if(!receipt)return err("የደረሰኙ ፋይል አልተገኘም።",400);
     await sql(env,"UPDATE senbet_finance_transactions SET type=?,category=?,amount=?,description=?,party_name=?,member_id=?,transaction_date=?,receipt_upload_id=?,receipt_file_name=?,receipt_mime_type=?,receipt_chunks=? WHERE id=?",[type,category,amount,String(body.description??old.description??"").trim(),String(body.partyName??old.partyName??"").trim(),body.memberId?String(body.memberId):null,date,receipt.uploadId,receipt.fileName,receipt.mimeType,receipt.chunks,id]);
