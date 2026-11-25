@@ -364,18 +364,45 @@ async function uploadToGoogleDrive(env,payload){
 }
 
 const UPLOAD_CHUNK_SIZE=15000000;
-const MAX_UPLOAD_SIZE=250000000;
-function preserveFileName(value){return String(value||"file").split(/[\\/]/).pop().replace(/[\r\n\0]/g,"_").trim()||"file";}
+const FILE_LIMITS={pdf:100000000,audio:50000000,video:200000000,other:50000000};
+const AUDIO_EXT=new Set(["mp3","wav","m4a","ogg","aac","flac"]);
+const VIDEO_EXT=new Set(["mp4","webm","mov","mkv","avi"]);
+const OTHER_EXT=new Set(["doc","docx","xls","xlsx","ppt","pptx","txt","csv","rtf","odt","ods","odp","png","jpg","jpeg","gif","webp","svg"]);
+function fileClass(name,mime=""){
+  const ext=String(name||"").toLowerCase().split(".").pop();
+  if(ext==="pdf"||mime==="application/pdf")return "pdf";
+  if(AUDIO_EXT.has(ext)||mime.startsWith("audio/"))return "audio";
+  if(VIDEO_EXT.has(ext)||mime.startsWith("video/"))return "video";
+  if(OTHER_EXT.has(ext)||mime.startsWith("image/")||mime.startsWith("text/"))return "other";
+  return null;
+}
+function validateUpload(name,mime,size){
+  const kind=fileClass(name,mime);
+  if(!kind)return {error:"This file type is not allowed. Choose PDF, supported audio/video, or a common document/image file."};
+  const limit=FILE_LIMITS[kind];
+  if(size>limit)return {error:kind==="pdf"?"PDF files must be 100 MB or smaller.":kind==="audio"?"Audio files must be 50 MB or smaller.":kind==="video"?"Video files must be 200 MB or smaller.":"Documents and images must be 50 MB or smaller."};
+  return {kind,limit};
+}
+function preserveFileName(value){return String(value||"file").split(/[\\\\/]/).pop().replace(/[\\r\\n\\0]/g,"_").trim()||"file";}
 function base64FromBytes(bytes){let binary="";for(let i=0;i<bytes.length;i+=0x8000)binary+=String.fromCharCode(...bytes.subarray(i,Math.min(i+0x8000,bytes.length)));return btoa(binary);}
 async function telegramStoreChunk(env,{blob,fileName,mimeType}){
   const token=String(env.TELEGRAM_BOT_TOKEN||"").trim(),chatId=String(env.TELEGRAM_STORAGE_CHAT_ID||"").trim();
   if(!token||!chatId)throw new Error("Telegram storage is not configured.");
-  const form=new FormData();form.append("chat_id",chatId);form.append("document",new Blob([await blob.arrayBuffer()],{type:mimeType||"application/octet-stream"}),fileName);
-  const response=await fetch("https://api.telegram.org/bot"+token+"/sendDocument",{method:"POST",body:form});
-  const raw=await response.text();let data=null;try{data=raw?JSON.parse(raw):null;}catch{}
-  const fileId=data?.result?.document?.file_id;
-  if(!response.ok||!data?.ok||typeof fileId!=="string"||!fileId)throw new Error(data?.description||"Telegram sendDocument failed (HTTP "+response.status+").");
-  return fileId;
+  let lastError;
+  for(let attempt=0;attempt<3;attempt++){
+    try{
+      const form=new FormData();form.append("chat_id",chatId);form.append("document",new Blob([await blob.arrayBuffer()],{type:mimeType||"application/octet-stream"}),fileName);
+      const response=await fetch("https://api.telegram.org/bot"+token+"/sendDocument",{method:"POST",body:form});
+      const raw=await response.text();let data=null;try{data=raw?JSON.parse(raw):null;}catch{}
+      const fileId=data?.result?.document?.file_id;
+      if(response.ok&&data?.ok&&typeof fileId==="string"&&fileId)return fileId;
+      const message=data?.description||"Telegram sendDocument failed (HTTP "+response.status+").";
+      if(response.status<500&&response.status!==429)throw new Error(message);
+      lastError=new Error(message);
+    }catch(error){lastError=error;if(attempt===2)break;}
+    if(attempt<2)await new Promise(resolve=>setTimeout(resolve,250*(attempt+1)));
+  }
+  throw lastError||new Error("Telegram upload failed.");
 }
 async function driveStoreChunk(env,{bytes,fileName,mimeType}){
   if(!googleDriveScriptUrl(env))throw new Error("Google Drive storage is not configured.");
@@ -384,53 +411,64 @@ async function driveStoreChunk(env,{bytes,fileName,mimeType}){
   if(!response.ok||!data?.fileId)throw new Error(data?.error||"Google Drive chunk upload failed.");
   return data.fileId;
 }
-async function uploadChunkCore(env,actor,body){
+async function mirrorChunkLater(env,uploadId,chunkIndex,bytes,fileName,mimeType){
+  try{
+    const fileId=await driveStoreChunk(env,{bytes,fileName,mimeType});
+    const key="upload:"+uploadId,raw=await kvGet(env,key);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
+    if(!stage||!stage.chunks?.[chunkIndex])return;
+    stage.chunks[chunkIndex]={...stage.chunks[chunkIndex],googleDriveFileId:fileId};
+    await kvPut(env,key,JSON.stringify(stage),{expirationTtl:86400});
+    for(const table of ["resources","materials","reports"]){
+      const rows=await all(env,table),row=rows.find(item=>item.uploadId===uploadId);
+      if(row){row.storageChunks=stage.chunks;row.googleDriveFileIds=stage.chunks.map(c=>c.googleDriveFileId||null);await put(env,table,row);}
+    }
+  }catch(error){console.warn("Background Google Drive mirror failed; Telegram copy remains permanent",error);}
+}
+async function uploadChunkCore(env,actor,body,ctx){
   const blob=body.file;
   const uploadId=String(body.uploadId||"").trim(),chunkIndex=Number(body.chunkIndex),totalChunks=Number(body.totalChunks),fileSize=Number(body.fileSize);
   const originalName=preserveFileName(body.originalName||body.originalFileName||blob?.name),mimeType=String(body.mimeType||blob?.type||mimeFor(originalName)).trim();
-  if(!blob||typeof blob.arrayBuffer!=="function"||!uploadId||!/^[A-Za-z0-9_-]{16,80}$/.test(uploadId)||!originalName||!Number.isInteger(chunkIndex)||!Number.isInteger(totalChunks)||!Number.isSafeInteger(fileSize)||fileSize<=0||fileSize>MAX_UPLOAD_SIZE||totalChunks!==Math.ceil(fileSize/UPLOAD_CHUNK_SIZE)||chunkIndex<0||chunkIndex>=totalChunks)return err("የፋይል ክፍሉ መረጃ ትክክል አይደለም።",400);
-  if(blob.size>UPLOAD_CHUNK_SIZE)return err("እያንዳንዱ የፋይል ክፍል ከ15 MB መብለጥ የለበትም።",413);
+  const validation=validateUpload(originalName,mimeType,fileSize);
+  if(validation.error)return err(validation.error,413);
+  if(!blob||typeof blob.arrayBuffer!=="function"||!uploadId||!/^[A-Za-z0-9_-]{16,80}$/.test(uploadId)||!originalName||!Number.isInteger(chunkIndex)||!Number.isInteger(totalChunks)||!Number.isSafeInteger(fileSize)||fileSize<=0||totalChunks!==Math.ceil(fileSize/UPLOAD_CHUNK_SIZE)||chunkIndex<0||chunkIndex>=totalChunks)return err("የፋይል ክፍሉ መረጃ ትክክል አይደለም።",400);
+  if(blob.size>UPLOAD_CHUNK_SIZE)return err("Each upload chunk must be 15 MB or smaller.",413);
   const expectedSize=Math.min(UPLOAD_CHUNK_SIZE,fileSize-chunkIndex*UPLOAD_CHUNK_SIZE);
   if(blob.size!==expectedSize)return err("የፋይል ክፍሉ መጠን ከተጠበቀው ጋር አይዛመድም።",400);
   const stageKey="upload:"+uploadId,stageRaw=await kvGet(env,stageKey);let stage=null;
   try{stage=stageRaw?JSON.parse(stageRaw):null;}catch{}
   if(stage&&(stage.userId!==actor.id||stage.fileSize!==fileSize||stage.totalChunks!==totalChunks||stage.originalName!==originalName))return err("ይህ የመጫኛ መለያ ከዚህ ፋይል ጋር አይዛመድም።",409);
-  if(stage?.chunks?.[chunkIndex])return json({ok:true,chunkIndex,alreadyUploaded:true,fileId:stage.chunks[chunkIndex].telegramFileId||null});
+  if(stage?.chunks?.[chunkIndex]?.telegramFileId)return json({ok:true,chunkIndex,alreadyUploaded:true,fileId:stage.chunks[chunkIndex].telegramFileId});
   const bytes=new Uint8Array(await blob.arrayBuffer());
   const driveName=originalName+".part-"+String(chunkIndex+1).padStart(3,"0");
-  const outcomes=await Promise.allSettled([
-    telegramStoreChunk(env,{blob,fileName:driveName,mimeType}),
-    driveStoreChunk(env,{bytes,fileName:driveName,mimeType})
-  ]);
-  const telegramFileId=outcomes[0].status==="fulfilled"?outcomes[0].value:null;
-  const googleDriveFileId=outcomes[1].status==="fulfilled"?outcomes[1].value:null;
-  if(!telegramFileId&&!googleDriveFileId){
-    console.error("Both upload storage targets failed",{telegram:String(outcomes[0].reason||""),drive:String(outcomes[1].reason||"")});
-    return err("ወደ Telegram ወይም Google Drive ማስቀመጥ አልተቻለም። እባክዎ የማገናኛ ቅንብሮችን ያረጋግጡና እንደገና ይሞክሩ።",502);
-  }
+  let telegramFileId;
+  try{telegramFileId=await telegramStoreChunk(env,{blob,fileName:driveName,mimeType});}
+  catch(error){console.error("Telegram chunk upload failed",error);return err("Could not save this chunk to permanent Telegram storage. Please retry.",502);}
   stage=stage||{uploadId,userId:actor.id,originalName,mimeType,fileSize,totalChunks,chunks:[],createdAt:Date.now()};
-  stage.chunks[chunkIndex]={chunkIndex,byteLength:blob.size,telegramFileId,googleDriveFileId};
+  stage.chunks[chunkIndex]={chunkIndex,byteLength:blob.size,telegramFileId,googleDriveFileId:null};
   await kvPut(env,stageKey,JSON.stringify(stage),{expirationTtl:86400});
-  return json({ok:true,chunkIndex,fileId:telegramFileId,storage:{telegram:!!telegramFileId,googleDrive:!!googleDriveFileId}});
+  if(ctx?.waitUntil)ctx.waitUntil(mirrorChunkLater(env,uploadId,chunkIndex,bytes,driveName,mimeType));
+  return json({ok:true,chunkIndex,fileId:telegramFileId,storage:{telegram:true,googleDrive:"pending"}});
 }
 async function finalizeUpload(env,actor,uploadId){
   const key="upload:"+String(uploadId||"").trim(),raw=await kvGet(env,key);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
   if(!stage)return err("የመጫኛ ክፍለ ጊዜ አልተገኘም።",404);
   if(stage.userId!==actor.id)return err("ፈቃድ የለዎትም።",403);
-  if(!Array.isArray(stage.chunks)||stage.chunks.length!==stage.totalChunks||Array.from({length:stage.totalChunks},(_,index)=>stage.chunks[index]).some((chunk,index)=>!chunk||chunk.chunkIndex!==index||(!chunk.telegramFileId&&!chunk.googleDriveFileId)))return err("ሁሉም የፋይል ክፍሎች ገና አልተጫኑም።",409);
+  if(!Array.isArray(stage.chunks)||stage.chunks.length!==stage.totalChunks||Array.from({length:stage.totalChunks},(_,index)=>stage.chunks[index]).some((chunk,index)=>!chunk||chunk.chunkIndex!==index||!chunk.telegramFileId))return err("ሁሉም የፋይል ክፍሎች ገና አልተጫኑም።",409);
   stage.finalized=true;stage.finalizedAt=Date.now();await kvPut(env,key,JSON.stringify(stage),{expirationTtl:86400});
   return json({uploadId:stage.uploadId,originalFileName:stage.originalName,mimeType:stage.mimeType,fileSize:stage.fileSize,totalChunks:stage.totalChunks});
 }
-async function uploadSingleFile(env,actor,body){
+async function uploadSingleFile(env,actor,body,ctx){
   let file=body.file;
   if(!file&&typeof body.base64==="string"){
     try{const binary=atob(body.base64);const bytes=Uint8Array.from(binary,c=>c.charCodeAt(0));file=new Blob([bytes],{type:body.mimeType||"application/octet-stream"});}catch{return err("Base64 ፋይሉ ትክክል አይደለም።",400);}
   }
   if(!file)return err("ፋይል አልተሰጠም።",400);
-  if(file.size>UPLOAD_CHUNK_SIZE)return err("ከ15 MB በላይ የሆነ ፋይል በቁራጭ መጫን አለበት።",413);
+  const validation=validateUpload(body.originalName||body.originalFileName||file.name,body.mimeType||file.type,file.size);
+  if(validation.error)return err(validation.error,413);
+  if(file.size>UPLOAD_CHUNK_SIZE)return err("Files larger than 15 MB must be uploaded in chunks.",413);
   const uploadId=String(body.uploadId||crypto.randomUUID());
   const chunkBody={...body,file,uploadId,chunkIndex:0,totalChunks:1,fileSize:file.size,originalName:body.originalName||body.originalFileName||file.name,mimeType:body.mimeType||file.type||"application/octet-stream"};
-  const uploaded=await uploadChunkCore(env,actor,chunkBody);
+  const uploaded=await uploadChunkCore(env,actor,chunkBody,ctx);
   if(!uploaded.ok)return uploaded;
   const uploadResult=await uploaded.json().catch(()=>({}));
   const finalized=await finalizeUpload(env,actor,uploadId);
@@ -533,7 +571,7 @@ async function legacyCreateStoredFile(body){
   if(!name||!drive||/\s/.test(drive))return null;
   return {fileUrl:"gdrive:"+drive,fileName:name,resourceType:resourceType(name,mime,body.resourceType||body.fileType)};
 }
-async function handler(request,env){
+async function handler(request,env,ctx){
   const url=new URL(request.url),path=url.pathname,method=request.method;
   if(method==="GET"&&path==="/googleba7f61ba454e7933.html"){
     return new Response("google-site-verification: googleba7f61ba454e7933.html",{status:200,headers:{"content-type":"text/html; charset=utf-8","cache-control":"public, max-age=3600","x-content-type-options":"nosniff"}});
@@ -591,7 +629,7 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
   }
   if(path==="/api/files/upload-chunk"&&method==="POST"){
     if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
-    return uploadChunkCore(env,actor,body);
+    return uploadChunkCore(env,actor,body,ctx);
   }
   if(path==="/api/files/finalize"&&method==="POST"){
     if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
@@ -599,7 +637,7 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
   }
   if(path==="/api/files/upload"&&method==="POST"){
     if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
-    return uploadSingleFile(env,actor,body);
+    return uploadSingleFile(env,actor,body,ctx);
   }
   const idMatch=path.match(/^\/api\/(users|resources|exams|reports|directives|dept-materials|departments\/materials|departments\/reports)\/(\d+)$/);
   if(path==="/api/admin/tidb-migration"&&method==="GET"){
@@ -820,6 +858,6 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
 }
 export async function scheduled(event,env,ctx){ctx.waitUntil((async()=>{await ensureSchema(env);try{await migrateKvBatch(env,1000);}catch(error){console.error("Scheduled SENBET KV migration batch failed",error);}await cleanupExpiredFiles(env);})());}
 export default {
-  async fetch(request,env){try{return await handler(request,env);}catch(e){console.error("SENBET Worker error",e);if(new URL(request.url).pathname.startsWith("/api/"))return err("የአገልጋይ ስህተት ተከስቷል።",500);return new Response("Internal Server Error",{status:500});}},
+  async fetch(request,env,ctx){try{return await handler(request,env,ctx);}catch(e){console.error("SENBET Worker error",e);if(new URL(request.url).pathname.startsWith("/api/"))return err("የአገልጋይ ስህተት ተከስቷል።",500);return new Response("Internal Server Error",{status:500});}},
   async scheduled(event,env,ctx){ctx.waitUntil((async()=>{await ensureSchema(env);try{await migrateKvBatch(env,1000);}catch(error){console.error("Scheduled SENBET KV migration batch failed",error);}await cleanupExpiredFiles(env);})());}
 };
