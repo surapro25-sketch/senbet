@@ -414,10 +414,11 @@ async function driveStoreChunk(env,{bytes,fileName,mimeType}){
 async function mirrorChunkLater(env,uploadId,chunkIndex,bytes,fileName,mimeType){
   try{
     const fileId=await driveStoreChunk(env,{bytes,fileName,mimeType});
+    const chunkKey="upload:"+uploadId+":chunk:"+chunkIndex,chunkRaw=await kvGet(env,chunkKey);let chunk=null;try{chunk=chunkRaw?JSON.parse(chunkRaw):null;}catch{}
+    if(!chunk)return;
+    chunk.googleDriveFileId=fileId;await kvPut(env,chunkKey,JSON.stringify(chunk),{expirationTtl:86400});
     const key="upload:"+uploadId,raw=await kvGet(env,key);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
-    if(!stage||!stage.chunks?.[chunkIndex])return;
-    stage.chunks[chunkIndex]={...stage.chunks[chunkIndex],googleDriveFileId:fileId};
-    await kvPut(env,key,JSON.stringify(stage),{expirationTtl:86400});
+    if(stage?.finalized&&Array.isArray(stage.chunks)){stage.chunks[chunkIndex]=chunk;await kvPut(env,key,JSON.stringify(stage),{expirationTtl:86400});}
     for(const table of ["resources","materials","reports"]){
       const rows=await all(env,table),row=rows.find(item=>item.uploadId===uploadId);
       if(row){row.storageChunks=stage.chunks;row.googleDriveFileIds=stage.chunks.map(c=>c.googleDriveFileId||null);await put(env,table,row);}
@@ -443,9 +444,10 @@ async function uploadChunkCore(env,actor,body,ctx){
   let telegramFileId;
   try{telegramFileId=await telegramStoreChunk(env,{blob,fileName:driveName,mimeType});}
   catch(error){console.error("Telegram chunk upload failed",error);return err("Could not save this chunk to permanent Telegram storage. Please retry.",502);}
-  stage=stage||{uploadId,userId:actor.id,originalName,mimeType,fileSize,totalChunks,chunks:[],createdAt:Date.now()};
-  stage.chunks[chunkIndex]={chunkIndex,byteLength:blob.size,telegramFileId,googleDriveFileId:null};
-  await kvPut(env,stageKey,JSON.stringify(stage),{expirationTtl:86400});
+  const chunkRecord={chunkIndex,byteLength:blob.size,telegramFileId,googleDriveFileId:null};
+  const chunkKey=stageKey+":chunk:"+chunkIndex;
+  await kvPut(env,stageKey,JSON.stringify({uploadId,userId:actor.id,originalName,mimeType,fileSize,totalChunks,createdAt:stage?.createdAt||Date.now()}),{expirationTtl:86400});
+  await kvPut(env,chunkKey,JSON.stringify(chunkRecord),{expirationTtl:86400});
   if(ctx?.waitUntil)ctx.waitUntil(mirrorChunkLater(env,uploadId,chunkIndex,bytes,driveName,mimeType));
   return json({ok:true,chunkIndex,fileId:telegramFileId,storage:{telegram:true,googleDrive:"pending"}});
 }
@@ -453,8 +455,9 @@ async function finalizeUpload(env,actor,uploadId){
   const key="upload:"+String(uploadId||"").trim(),raw=await kvGet(env,key);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
   if(!stage)return err("የመጫኛ ክፍለ ጊዜ አልተገኘም።",404);
   if(stage.userId!==actor.id)return err("ፈቃድ የለዎትም።",403);
-  if(!Array.isArray(stage.chunks)||stage.chunks.length!==stage.totalChunks||Array.from({length:stage.totalChunks},(_,index)=>stage.chunks[index]).some((chunk,index)=>!chunk||chunk.chunkIndex!==index||!chunk.telegramFileId))return err("ሁሉም የፋይል ክፍሎች ገና አልተጫኑም።",409);
-  stage.finalized=true;stage.finalizedAt=Date.now();await kvPut(env,key,JSON.stringify(stage),{expirationTtl:86400});
+  const chunkRows=await Promise.all(Array.from({length:stage.totalChunks},async(_,index)=>{const rawChunk=await kvGet(env,key+":chunk:"+index);try{return rawChunk?JSON.parse(rawChunk):null;}catch{return null;}}));
+  if(chunkRows.some((chunk,index)=>!chunk||chunk.chunkIndex!==index||!chunk.telegramFileId))return err("ሁሉም የፋይል ክፍሎች ገና አልተጫኑም።",409);
+  stage.chunks=chunkRows;stage.finalized=true;stage.finalizedAt=Date.now();await kvPut(env,key,JSON.stringify(stage),{expirationTtl:86400});
   return json({uploadId:stage.uploadId,originalFileName:stage.originalName,mimeType:stage.mimeType,fileSize:stage.fileSize,totalChunks:stage.totalChunks});
 }
 async function uploadSingleFile(env,actor,body,ctx){
