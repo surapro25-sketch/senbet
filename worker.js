@@ -1,8 +1,9 @@
 /**
  * SENBET Cloudflare Worker API + Static Assets
- * Data is stored as JSON records in the SENBET_DB KV namespace.
+ * Metadata is stored in TiDB Cloud; SENBET_DB is retained only as the one-time migration source.
  * Existing API response envelopes and role checks are retained.
  */
+import { connect } from "@tidbcloud/serverless";
 const TABLES = ["users","sessions","departments","resources","exams","attendance","reports","directives","materials","messages"];
 const json = (data, status=200, headers={}) => new Response(JSON.stringify(data), {status,headers:{"content-type":"application/json; charset=utf-8",...headers}});
 const SEO_TERMS=["ደቂቀ መዊዕ","ቅዱስ መርቆሬዎስ","መጥምቀ መለኮት ቅዱስ ዮሐንስ","ደቂቀ መዊዕ ቅዱስ መርቆሬዎስ እና መጥምቀ መለኮት ቅዱስ ዮሐንስ","ሰንበት ትምህርት ቤት","ሰንበት","የሰንበት ትምህርት ቤት መምህራን እና ተማሪዎች","የኢትዮጵያ ኦርቶዶክስ ተዋሕዶ ሰንበት ትምህርት ቤት","Dekike Mewi","Dekike Mewie","Dekike Mewi Kidus Merkorios","Kidus Merkorios","St. Mercurius","Saint Mercurius","Metmike Melekot Kidus Yohannes","Kidus Yohannes","St. John the Baptist","Dekike Mewi Kidus Merkorios and Metmike Melekot Kidus Yohannes Sunday School","Senbet","Senbet Timhirt Bet","Senbet Temari","Sunday School","Ethiopian Orthodox Sunday School Portal","Addis Ababa Sunday School"];
@@ -29,24 +30,212 @@ function enhanceHtml(response) {
 
 const err = (error,status=400) => json({error},status);
 const now = () => new Date().toISOString().replace("T"," ").slice(0,19);
-const idKey = (table,id) => table+":"+id;
-async function all(env, table) {
-  const keys=[];
+
+const CORE_TABLES = {
+  users: { table: "senbet_users", columns: ["id","username","role","department","assigned_grade","full_name","created_at","payload"], values: row => [String(row.id), row.username ?? null, row.role ?? null, row.department ?? null, row.assignedGrade ?? null, row.fullName ?? null, sqlDateTime(row.createdAt), JSON.stringify(row)] },
+  resources: { table: "senbet_resources", columns: ["id","title","resource_type","target_grade","target_division","uploaded_by","created_at","expires_at","payload"], values: row => [String(row.id), row.title ?? null, row.resourceType ?? null, row.targetGrade ?? null, row.targetDivision ?? null, row.uploadedBy == null ? null : String(row.uploadedBy), sqlDateTime(row.createdAt), row.expiresAt == null ? null : Number(row.expiresAt), JSON.stringify(row)] },
+  materials: { table: "senbet_materials", columns: ["id","department","title","file_type","uploaded_by","created_at","expires_at","payload"], values: row => [String(row.id), row.department ?? null, row.title ?? null, row.fileType ?? null, row.uploadedBy == null ? null : String(row.uploadedBy), sqlDateTime(row.createdAt), row.expiresAt == null ? null : Number(row.expiresAt), JSON.stringify(row)] },
+  reports: { table: "senbet_reports", columns: ["id","department","submitted_by","status","title","created_at","expires_at","payload"], values: row => [String(row.id), row.department ?? null, row.submittedBy == null ? null : String(row.submittedBy), row.status ?? null, row.title ?? null, sqlDateTime(row.createdAt), row.expiresAt == null ? null : Number(row.expiresAt), JSON.stringify(row)] }
+};
+const schemaReady = new WeakMap();
+const migrationComplete = new WeakSet();
+function tidbConfig(env) {
+  const host = String(env.TIDB_HOST || "").trim().replace(/^https?:\/\//i, "").split("/")[0].replace(/:\d+$/, "");
+  const username = String(env.TIDB_USER || "").trim();
+  const password = String(env.TIDB_PASSWORD || "");
+  const database = String(env.TIDB_DATABASE || "").trim();
+  if (!host || !username || !password || !database) throw new Error("TiDB secrets are incomplete; expected TIDB_HOST, TIDB_USER, TIDB_PASSWORD, and TIDB_DATABASE.");
+  return { host, username, password, database };
+}
+async function sql(env, statement, params = null) {
+  const conn = connect(tidbConfig(env));
+  return conn.execute(statement, params);
+}
+function sqlDateTime(value) {
+  if (!value) return null;
+  const raw = String(value);
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw) ? raw.replace(" ", "T") + "Z" : raw;
+  const date = new Date(normalized);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 19).replace("T", " ");
+}
+function parsePayload(value) {
+  if (value == null) return null;
+  try { return typeof value === "string" ? JSON.parse(value) : value; } catch { return null; }
+}
+const DDL = [
+  "CREATE TABLE IF NOT EXISTS senbet_users (id VARCHAR(191) NOT NULL PRIMARY KEY, username VARCHAR(191) NULL, role VARCHAR(32) NULL, department VARCHAR(191) NULL, assigned_grade INT NULL, full_name VARCHAR(255) NULL, created_at DATETIME NULL, payload LONGTEXT NOT NULL, KEY idx_su_username (username), KEY idx_su_role_grade (role, assigned_grade), KEY idx_su_department (department)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+  "CREATE TABLE IF NOT EXISTS senbet_resources (id VARCHAR(191) NOT NULL PRIMARY KEY, title VARCHAR(255) NULL, resource_type VARCHAR(32) NULL, target_grade INT NULL, target_division VARCHAR(32) NULL, uploaded_by VARCHAR(191) NULL, created_at DATETIME NULL, expires_at BIGINT NULL, payload LONGTEXT NOT NULL, KEY idx_sr_grade_division (target_grade, target_division), KEY idx_sr_uploaded_by (uploaded_by), KEY idx_sr_created_at (created_at), KEY idx_sr_expires_at (expires_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+  "CREATE TABLE IF NOT EXISTS senbet_materials (id VARCHAR(191) NOT NULL PRIMARY KEY, department VARCHAR(191) NULL, title VARCHAR(255) NULL, file_type VARCHAR(32) NULL, uploaded_by VARCHAR(191) NULL, created_at DATETIME NULL, expires_at BIGINT NULL, payload LONGTEXT NOT NULL, KEY idx_sm_department (department), KEY idx_sm_uploaded_by (uploaded_by), KEY idx_sm_created_at (created_at), KEY idx_sm_expires_at (expires_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+  "CREATE TABLE IF NOT EXISTS senbet_reports (id VARCHAR(191) NOT NULL PRIMARY KEY, department VARCHAR(191) NULL, submitted_by VARCHAR(191) NULL, status VARCHAR(32) NULL, title VARCHAR(255) NULL, created_at DATETIME NULL, expires_at BIGINT NULL, payload LONGTEXT NOT NULL, KEY idx_sp_department_status (department, status), KEY idx_sp_submitted_by (submitted_by), KEY idx_sp_created_at (created_at), KEY idx_sp_expires_at (expires_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+  "CREATE TABLE IF NOT EXISTS senbet_records (table_name VARCHAR(64) NOT NULL, record_id VARCHAR(191) NOT NULL, created_at DATETIME NULL, payload LONGTEXT NOT NULL, PRIMARY KEY (table_name, record_id), KEY idx_srec_record_id (record_id), KEY idx_srec_created_at (created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+  "CREATE TABLE IF NOT EXISTS senbet_kv (key_name VARCHAR(512) NOT NULL PRIMARY KEY, value LONGTEXT NULL, expires_at BIGINT NULL, KEY idx_skv_expires_at (expires_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+  "CREATE TABLE IF NOT EXISTS senbet_migrations (migration_key VARCHAR(64) NOT NULL PRIMARY KEY, cursor_value LONGTEXT NULL, completed TINYINT NOT NULL DEFAULT 0, processed_count BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+];
+async function ensureSchema(env) {
+  let ready = schemaReady.get(env);
+  if (!ready) {
+    ready = (async () => {
+      for (const statement of DDL) await sql(env, statement);
+      await sql(env, "INSERT IGNORE INTO senbet_migrations (migration_key, cursor_value, completed, processed_count) VALUES (?, NULL, 0, 0)", ["kv_to_tidb_v1"]);
+    })();
+    schemaReady.set(env, ready);
+  }
+  try { await ready; } catch (error) { schemaReady.delete(env); throw error; }
+}
+async function migrationState(env) {
+  const rows = await sql(env, "SELECT cursor_value, completed, processed_count FROM senbet_migrations WHERE migration_key = ? LIMIT 1", ["kv_to_tidb_v1"]);
+  const row = rows[0] || {};
+  const done = Number(row.completed || 0) === 1;
+  if (done) migrationComplete.add(env);
+  return { complete: done, cursor: row.cursor_value || null, processedCount: Number(row.processed_count || 0) };
+}
+async function migrationDone(env) {
+  if (migrationComplete.has(env)) return true;
+  return (await migrationState(env)).complete;
+}
+async function insertMany(env, tableName, columns, rows, valueMapper) {
+  for (let start = 0; start < rows.length; start += 100) {
+    const batch = rows.slice(start, start + 100);
+    if (!batch.length) continue;
+    const tuple = "(" + columns.map(() => "?").join(",") + ")";
+    const valuesSql = batch.map(() => tuple).join(",");
+    await sql(env, "INSERT IGNORE INTO " + tableName + " (" + columns.join(",") + ") VALUES " + valuesSql, batch.flatMap(valueMapper));
+  }
+}
+async function importKvPage(env, keys) {
+  const core = { users: [], resources: [], materials: [], reports: [] };
+  const records = [];
+  const kvRows = [];
+  for (let start = 0; start < keys.length; start += 40) {
+    const batch = keys.slice(start, start + 40);
+    const values = await Promise.all(batch.map(async key => ({ key, value: await env.SENBET_DB.get(key.name) })));
+    for (const item of values) {
+      if (item.value == null) continue;
+      const keyName = item.key.name;
+      const split = keyName.indexOf(":");
+      const prefix = split < 0 ? "" : keyName.slice(0, split);
+      const suffix = split < 0 ? "" : keyName.slice(split + 1);
+      let row = null;
+      if (Object.prototype.hasOwnProperty.call(core, prefix)) {
+        row = parsePayload(item.value);
+        if (row && row.id != null) core[prefix].push(row);
+        else kvRows.push([keyName, item.value, item.key.expiration ? Number(item.key.expiration) * 1000 : null]);
+      } else if (TABLES.includes(prefix) && suffix) {
+        row = parsePayload(item.value);
+        if (row && row.id != null) records.push([prefix, String(row.id), sqlDateTime(row.createdAt), JSON.stringify(row)]);
+        else kvRows.push([keyName, item.value, item.key.expiration ? Number(item.key.expiration) * 1000 : null]);
+      } else {
+        kvRows.push([keyName, item.value, item.key.expiration ? Number(item.key.expiration) * 1000 : null]);
+      }
+    }
+  }
+  for (const [table, rows] of Object.entries(core)) {
+    const config = CORE_TABLES[table];
+    if (rows.length) await insertMany(env, config.table, config.columns, rows, row => config.values(row));
+  }
+  if (records.length) await insertMany(env, "senbet_records", ["table_name","record_id","created_at","payload"], records, row => row);
+  if (kvRows.length) await insertMany(env, "senbet_kv", ["key_name","value","expires_at"], kvRows, row => row);
+}
+async function migrateKvBatch(env, limit = 1000) {
+  const state = await migrationState(env);
+  if (state.complete) return state;
+  if (!env.SENBET_DB) throw new Error("SENBET_DB KV binding is required for the one-time migration.");
+  const options = { limit: Math.min(1000, Math.max(1, limit)), ...(state.cursor ? { cursor: state.cursor } : {}) };
+  const page = await env.SENBET_DB.list(options);
+  const keys = page.keys || [];
+  await importKvPage(env, keys);
+  const complete = Boolean(page.list_complete);
+  const cursor = complete ? null : (page.cursor || null);
+  await sql(env, "UPDATE senbet_migrations SET cursor_value = ?, completed = ?, processed_count = processed_count + ? WHERE migration_key = ?", [cursor, complete ? 1 : 0, keys.length, "kv_to_tidb_v1"]);
+  return migrationState(env);
+}
+async function listKvTable(env, table) {
+  const keys = [];
   let cursor;
   do {
-    const page=await env.SENBET_DB.list({prefix:table+":",...(cursor?{cursor}:{})});
-    keys.push(...(page.keys||[]));
-    cursor=page.list_complete?undefined:page.cursor;
-  } while(cursor);
-  const rows=await Promise.all(keys.map(async k=>{try{return JSON.parse(await env.SENBET_DB.get(k.name));}catch{return null;}}));
-  return rows.filter(Boolean);
+    const page = await env.SENBET_DB.list({ prefix: table + ":", limit: 1000, ...(cursor ? { cursor } : {}) });
+    keys.push(...(page.keys || []));
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  const rows = [];
+  for (let start = 0; start < keys.length; start += 40) {
+    const batch = keys.slice(start, start + 40);
+    const values = await Promise.all(batch.map(async key => parsePayload(await env.SENBET_DB.get(key.name))));
+    rows.push(...values.filter(Boolean));
+  }
+  return rows;
 }
-async function get(env,table,id) { const s=await env.SENBET_DB.get(idKey(table,id)); try{return s?JSON.parse(s):null;}catch{return null;} }
-async function put(env,table,row) { await env.SENBET_DB.put(idKey(table,row.id),JSON.stringify(row)); return row; }
-async function remove(env,table,id) { await env.SENBET_DB.delete(idKey(table,id)); }
-async function nextId(env,table) {
-  const key="seq:"+table, n=Number(await env.SENBET_DB.get(key)||0)+1;
-  await env.SENBET_DB.put(key,String(n)); return n;
+async function all(env, table) {
+  const config = CORE_TABLES[table];
+  const result = config ? await sql(env, "SELECT payload FROM " + config.table) : await sql(env, "SELECT payload FROM senbet_records WHERE table_name = ?", [table]);
+  const rows = result.map(row => parsePayload(row.payload)).filter(Boolean);
+  if (await migrationDone(env) || !env.SENBET_DB) return rows;
+  const merged = new Map(rows.map(row => [String(row.id), row]));
+  for (const row of await listKvTable(env, table)) if (!merged.has(String(row.id))) merged.set(String(row.id), row);
+  return [...merged.values()];
+}
+async function get(env, table, id) {
+  const config = CORE_TABLES[table];
+  const result = config ? await sql(env, "SELECT payload FROM " + config.table + " WHERE id = ? LIMIT 1", [String(id)]) : await sql(env, "SELECT payload FROM senbet_records WHERE table_name = ? AND record_id = ? LIMIT 1", [table, String(id)]);
+  const row = result[0] ? parsePayload(result[0].payload) : null;
+  if (row || await migrationDone(env) || !env.SENBET_DB) return row;
+  return parsePayload(await env.SENBET_DB.get(idKey(table, id)));
+}
+async function put(env, table, row) {
+  const config = CORE_TABLES[table];
+  if (config) {
+    const values = config.values(row);
+    const placeholders = "(" + config.columns.map(() => "?").join(",") + ")";
+    const updates = config.columns.slice(1).map(column => column + "=VALUES(" + column + ")").join(",");
+    await sql(env, "INSERT INTO " + config.table + " (" + config.columns.join(",") + ") VALUES " + placeholders + " ON DUPLICATE KEY UPDATE " + updates, values);
+  } else {
+    await sql(env, "INSERT INTO senbet_records (table_name,record_id,created_at,payload) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE created_at=VALUES(created_at), payload=VALUES(payload)", [table, String(row.id), sqlDateTime(row.createdAt), JSON.stringify(row)]);
+  }
+  if (!(await migrationDone(env)) && env.SENBET_DB) await env.SENBET_DB.put(idKey(table, row.id), JSON.stringify(row));
+  return row;
+}
+async function remove(env, table, id) {
+  const config = CORE_TABLES[table];
+  if (config) await sql(env, "DELETE FROM " + config.table + " WHERE id = ?", [String(id)]);
+  else await sql(env, "DELETE FROM senbet_records WHERE table_name = ? AND record_id = ?", [table, String(id)]);
+  if (!(await migrationDone(env)) && env.SENBET_DB) await env.SENBET_DB.delete(idKey(table, id));
+}
+async function kvGet(env, key) {
+  const rows = await sql(env, "SELECT value, expires_at FROM senbet_kv WHERE key_name = ? LIMIT 1", [key]);
+  if (rows[0]) {
+    const expires = rows[0].expires_at == null ? null : Number(rows[0].expires_at);
+    if (expires && expires <= Date.now()) {
+      await sql(env, "DELETE FROM senbet_kv WHERE key_name = ?", [key]);
+      if (!(await migrationDone(env)) && env.SENBET_DB) await env.SENBET_DB.delete(key);
+      return null;
+    }
+    return rows[0].value == null ? null : String(rows[0].value);
+  }
+  if (await migrationDone(env) || !env.SENBET_DB) return null;
+  return env.SENBET_DB.get(key);
+}
+async function kvPut(env, key, value, options = {}) {
+  const ttl = Number(options.expirationTtl || 0);
+  const expiresAt = ttl > 0 ? Date.now() + ttl * 1000 : null;
+  await sql(env, "INSERT INTO senbet_kv (key_name,value,expires_at) VALUES (?,?,?) ON DUPLICATE KEY UPDATE value=VALUES(value), expires_at=VALUES(expires_at)", [key, String(value), expiresAt]);
+  if (!(await migrationDone(env)) && env.SENBET_DB) {
+    if (ttl > 0) await env.SENBET_DB.put(key, String(value), { expirationTtl: ttl });
+    else await env.SENBET_DB.put(key, String(value));
+  }
+}
+async function kvDelete(env, key) {
+  await sql(env, "DELETE FROM senbet_kv WHERE key_name = ?", [key]);
+  if (!(await migrationDone(env)) && env.SENBET_DB) await env.SENBET_DB.delete(key);
+}
+async function nextId(env, table) {
+  const key = "seq:" + table;
+  const n = Number(await kvGet(env, key) || 0) + 1;
+  await kvPut(env, key, String(n));
+  return n;
+}
+async function migrationStatus(env) {
+  const state = await migrationState(env);
+  return { database: "TiDB Cloud", migration: "Workers KV to TiDB", ...state };
 }
 const sortNewest=(a,b)=>String(b.createdAt||"").localeCompare(String(a.createdAt||""))||Number(b.id)-Number(a.id);
 const sortName=(a,b)=>String(a.fullName||"").localeCompare(String(b.fullName||""));
@@ -59,7 +248,7 @@ function safeName(s){return String(s||"file").split(/[\\/]/).pop().replace(/[\r\
 function disposition(type,name){const n=preserveFileName(name||"download");const ascii=n.replace(/[^\x20-\x7e]/g,"_").replace(/"/g,"'");return type+'; filename="'+ascii+'"; filename*=UTF-8\'\''+encodeURIComponent(n);}
 async function readBody(req){const ct=req.headers.get("content-type")||"";if(ct.includes("application/json"))return await req.json().catch(()=>({}));if(ct.includes("multipart/form-data")){const f=await req.formData(),o={};for(const [k,v] of f.entries()){if(typeof v==="string")o[k]=v;else if(v&&typeof v.arrayBuffer==="function"){o.file=v;if(!o.originalFileName&&v.name)o.originalFileName=v.name;if(!o.mimeType&&v.type)o.mimeType=v.type;}}return o;}return {};}
 async function ensureSeed(env){
-  if(await env.SENBET_DB.get("meta:initialized"))return;
+  if(await kvGet(env,"meta:initialized"))return;
   const depts=[
     ["education","ትምህርት ክፍል","የትምህርት ካሪኩለም፣ የመጽሐፍ ቅዱስና የቤተ ክርስቲያን ታሪክ ትምህርቶች አስተባባሪ",false],
     ["choir","መዝሙር ክፍል","የመዝሙር ልምምድ፣ የበገናና የከበሮ አገልግሎት (PDF፣ ኦዲዮ እና ቪዲዮ ግብአቶች)",true],
@@ -71,8 +260,8 @@ async function ensureSeed(env){
   const salt=crypto.getRandomValues(new Uint8Array(16));
   const hash=await hashPassword("admin123",salt);
   await put(env,"users",{id:1,username:"admin",passwordHash:hash,passwordSalt:Array.from(salt),fullName:"SENBET Administrator",role:"head",age:32,educationLevel:"ዲግሪ",assignedGrade:null,department:null,subject:null,phone:null,createdAt:now()});
-  await env.SENBET_DB.put("seq:users","1");
-  await env.SENBET_DB.put("meta:initialized","1");
+  await kvPut(env,"seq:users","1");
+  await kvPut(env,"meta:initialized","1");
 }
 const PBKDF2_ITERATIONS=100000;
 async function hashPassword(password,saltBytes){const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveBits"]);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt:saltBytes,iterations:PBKDF2_ITERATIONS,hash:"SHA-256"},key,256);return Array.from(new Uint8Array(bits)).map(x=>x.toString(16).padStart(2,"0")).join("");}
@@ -203,7 +392,7 @@ async function uploadChunkCore(env,actor,body){
   if(blob.size>UPLOAD_CHUNK_SIZE)return err("እያንዳንዱ የፋይል ክፍል ከ15 MB መብለጥ የለበትም።",413);
   const expectedSize=Math.min(UPLOAD_CHUNK_SIZE,fileSize-chunkIndex*UPLOAD_CHUNK_SIZE);
   if(blob.size!==expectedSize)return err("የፋይል ክፍሉ መጠን ከተጠበቀው ጋር አይዛመድም።",400);
-  const stageKey="upload:"+uploadId,stageRaw=await env.SENBET_DB.get(stageKey);let stage=null;
+  const stageKey="upload:"+uploadId,stageRaw=await kvGet(env,stageKey);let stage=null;
   try{stage=stageRaw?JSON.parse(stageRaw):null;}catch{}
   if(stage&&(stage.userId!==actor.id||stage.fileSize!==fileSize||stage.totalChunks!==totalChunks||stage.originalName!==originalName))return err("ይህ የመጫኛ መለያ ከዚህ ፋይል ጋር አይዛመድም።",409);
   if(stage?.chunks?.[chunkIndex])return json({ok:true,chunkIndex,alreadyUploaded:true,fileId:stage.chunks[chunkIndex].telegramFileId||null});
@@ -221,15 +410,15 @@ async function uploadChunkCore(env,actor,body){
   }
   stage=stage||{uploadId,userId:actor.id,originalName,mimeType,fileSize,totalChunks,chunks:[],createdAt:Date.now()};
   stage.chunks[chunkIndex]={chunkIndex,byteLength:blob.size,telegramFileId,googleDriveFileId};
-  await env.SENBET_DB.put(stageKey,JSON.stringify(stage),{expirationTtl:86400});
+  await kvPut(env,stageKey,JSON.stringify(stage),{expirationTtl:86400});
   return json({ok:true,chunkIndex,fileId:telegramFileId,storage:{telegram:!!telegramFileId,googleDrive:!!googleDriveFileId}});
 }
 async function finalizeUpload(env,actor,uploadId){
-  const key="upload:"+String(uploadId||"").trim(),raw=await env.SENBET_DB.get(key);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
+  const key="upload:"+String(uploadId||"").trim(),raw=await kvGet(env,key);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
   if(!stage)return err("የመጫኛ ክፍለ ጊዜ አልተገኘም።",404);
   if(stage.userId!==actor.id)return err("ፈቃድ የለዎትም።",403);
   if(!Array.isArray(stage.chunks)||stage.chunks.length!==stage.totalChunks||Array.from({length:stage.totalChunks},(_,index)=>stage.chunks[index]).some((chunk,index)=>!chunk||chunk.chunkIndex!==index||(!chunk.telegramFileId&&!chunk.googleDriveFileId)))return err("ሁሉም የፋይል ክፍሎች ገና አልተጫኑም።",409);
-  stage.finalized=true;stage.finalizedAt=Date.now();await env.SENBET_DB.put(key,JSON.stringify(stage),{expirationTtl:86400});
+  stage.finalized=true;stage.finalizedAt=Date.now();await kvPut(env,key,JSON.stringify(stage),{expirationTtl:86400});
   return json({uploadId:stage.uploadId,originalFileName:stage.originalName,mimeType:stage.mimeType,fileSize:stage.fileSize,totalChunks:stage.totalChunks});
 }
 async function uploadSingleFile(env,actor,body){
@@ -302,7 +491,7 @@ async function createStoredFile(env,body,actor){
     const driveId=legacy.fileUrl.slice(7);
     return {...legacy,storageChunks:[{chunkIndex:0,byteLength:0,telegramFileId:null,googleDriveFileId:driveId}],uploadId:null};
   }
-  const raw=await env.SENBET_DB.get("upload:"+uploadId);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
+  const raw=await kvGet(env,"upload:"+uploadId);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
   if(!stage||!stage.finalized||stage.userId!==actor.id)return null;
   const name=preserveFileName(stage.originalName),mime=stage.mimeType||mimeFor(name);
   return {fileUrl:"",fileName:name,resourceType:resourceType(name,mime,body.resourceType||body.fileType),storageChunks:stage.chunks,uploadId};
@@ -376,6 +565,8 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
   </url>
 </urlset>`,{headers:{"content-type":"application/xml; charset=utf-8","cache-control":"public, max-age=3600"}});
   }
+  await ensureSchema(env);
+  try { await migrateKvBatch(env, 1000); } catch (migrationError) { console.error("SENBET KV migration batch failed; continuing with dual-read/dual-write compatibility", migrationError); }
   await ensureSeed(env);
   if(path==="/api/files/download"&&method==="GET")return fileResponse(request,env,"download");
   if(path==="/api/files/preview"&&method==="GET")return fileResponse(request,env,"preview");
@@ -407,6 +598,15 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
     return uploadSingleFile(env,actor,body);
   }
   const idMatch=path.match(/^\/api\/(users|resources|exams|reports|directives|dept-materials|departments\/materials|departments\/reports)\/(\d+)$/);
+  if(path==="/api/admin/tidb-migration"&&method==="GET"){
+    if(actor.role!=="head")return err("የዋና ሀላፊ ፈቃድ ያስፈልጋል።",403);
+    return json(await migrationStatus(env));
+  }
+  if(path==="/api/admin/tidb-migration"&&method==="POST"){
+    if(actor.role!=="head")return err("የዋና ሀላፊ ፈቃድ ያስፈልጋል።",403);
+    try { await migrateKvBatch(env,1000); return json(await migrationStatus(env)); }
+    catch(error) { console.error("SENBET admin migration batch failed",error); return err("TiDB የዳታ ማዛወር አልተሳካም።",502); }
+  }
   // Departments
   if(path==="/api/departments"&&method==="GET"){const rows=(await all(env,"departments")).sort((x,y)=>String(x.createdAt).localeCompare(String(y.createdAt)));return json({departments:rows.map(d=>({...d,allowsMedia:Boolean(d.allowsMedia)}))});}
   if(path==="/api/departments"&&method==="POST"){
@@ -614,8 +814,8 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
   if(env.ASSETS){const asset=await env.ASSETS.fetch(request);if(asset.status!==404)return enhanceHtml(asset);const index=await env.ASSETS.fetch(new Request(new URL("/index.html",request.url),request));if(index.ok)return enhanceHtml(index);return asset;}
   return new Response("Frontend assets binding ASSETS is unavailable.",{status:500});
 }
-export async function scheduled(event,env,ctx){ctx.waitUntil(cleanupExpiredFiles(env));}
+export async function scheduled(event,env,ctx){ctx.waitUntil((async()=>{await ensureSchema(env);try{await migrateKvBatch(env,1000);}catch(error){console.error("Scheduled SENBET KV migration batch failed",error);}await cleanupExpiredFiles(env);})());}
 export default {
   async fetch(request,env){try{return await handler(request,env);}catch(e){console.error("SENBET Worker error",e);if(new URL(request.url).pathname.startsWith("/api/"))return err("የአገልጋይ ስህተት ተከስቷል።",500);return new Response("Internal Server Error",{status:500});}},
-  async scheduled(event,env,ctx){ctx.waitUntil(cleanupExpiredFiles(env));}
+  async scheduled(event,env,ctx){ctx.waitUntil((async()=>{await ensureSchema(env);try{await migrateKvBatch(env,1000);}catch(error){console.error("Scheduled SENBET KV migration batch failed",error);}await cleanupExpiredFiles(env);})());}
 };
