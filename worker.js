@@ -418,10 +418,14 @@ async function mirrorChunkLater(env,uploadId,chunkIndex,bytes,fileName,mimeType)
     if(!chunk)return;
     chunk.googleDriveFileId=fileId;await kvPut(env,chunkKey,JSON.stringify(chunk),{expirationTtl:86400});
     const key="upload:"+uploadId,raw=await kvGet(env,key);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
-    if(stage?.finalized&&Array.isArray(stage.chunks)){stage.chunks[chunkIndex]=chunk;await kvPut(env,key,JSON.stringify(stage),{expirationTtl:86400});}
+    if(!stage)return;
+    const chunks=await Promise.all(Array.from({length:stage.totalChunks},async(_,index)=>{const value=await kvGet(env,key+":chunk:"+index);try{return value?JSON.parse(value):null;}catch{return null;}}));
+    if(chunks.some(value=>!value))return;
+    stage.chunks=chunks;
+    if(stage.finalized)await kvPut(env,key,JSON.stringify(stage),{expirationTtl:86400});
     for(const table of ["resources","materials","reports"]){
       const rows=await all(env,table),row=rows.find(item=>item.uploadId===uploadId);
-      if(row){row.storageChunks=stage.chunks;row.googleDriveFileIds=stage.chunks.map(c=>c.googleDriveFileId||null);await put(env,table,row);}
+      if(row){row.storageChunks=chunks;row.googleDriveFileIds=chunks.map(value=>value.googleDriveFileId||null);await put(env,table,row);}
     }
   }catch(error){console.warn("Background Google Drive mirror failed; Telegram copy remains permanent",error);}
 }
