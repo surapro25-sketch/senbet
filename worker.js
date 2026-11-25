@@ -437,6 +437,7 @@ async function mirrorChunkLater(env,uploadId,chunkIndex,bytes,fileName,mimeType)
       const rows=await all(env,table),row=rows.find(item=>item.uploadId===uploadId);
       if(row){row.storageChunks=chunks;row.googleDriveFileIds=chunks.map(value=>value.googleDriveFileId||null);await put(env,table,row);}
     }
+    await sql(env,"UPDATE senbet_finance_transactions SET receipt_chunks=? WHERE receipt_upload_id=?",[JSON.stringify(chunks),uploadId]);
   }catch(error){console.warn("Background Google Drive mirror failed; Telegram copy remains permanent",error);}
 }
 async function uploadChunkCore(env,actor,body,ctx){
@@ -746,15 +747,15 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
     return createGoogleDriveUploadSession(env,{fileName,mimeType,fileSize});
   }
   if(path==="/api/files/upload-chunk"&&method==="POST"){
-    if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
+    if(!["head","teacher","dept_head","accountant"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
     return uploadChunkCore(env,actor,body,ctx);
   }
   if(path==="/api/files/finalize"&&method==="POST"){
-    if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
+    if(!["head","teacher","dept_head","accountant"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
     return finalizeUpload(env,actor,body.uploadId);
   }
   if(path==="/api/files/upload"&&method==="POST"){
-    if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
+    if(!["head","teacher","dept_head","accountant"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
     return uploadSingleFile(env,actor,body,ctx);
   }
   const idMatch=path.match(/^\/api\/(users|resources|exams|reports|directives|dept-materials|departments\/materials|departments\/reports)\/(\d+)$/);
@@ -828,6 +829,7 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
     if(actor.role!=="head"&&actor.id!==targetId)return err("የሌላ ተጠቃሚ መረጃ ለማስተካከል ፈቃድ የለዎትም።",403);
     const users=await all(env,"users");if(body.username&&body.username.trim()!==u.username&&users.some(x=>x.id!==targetId&&x.username===String(body.username).trim()))return err("ይህ የመግቢያ ስም (Username) በሌላ ሰው ተይዟል።",409);
     if(actor.role==="head"){
+      if(body.role!==undefined&&!["head","teacher","student","dept_head","dept_member","accountant"].includes(body.role))return err("ትክክለኛ የስራ ድርሻ (Role) ይምረጡ።");
       for(const k of ["fullName","username","age","educationLevel","assignedGrade","department","role","phone"])if(body[k]!==undefined)u[k]=["fullName","username","educationLevel","department","phone"].includes(k)?(body[k]?String(body[k]).trim():null):(["age","assignedGrade"].includes(k)?(body[k]===""||body[k]===null?null:Number(body[k])):body[k]);
       if(u.role==="teacher"&&body.subject!==undefined)u.subject=body.subject?String(body.subject).trim():null;else if(u.role!=="teacher")u.subject=null;
     }else{for(const k of ["fullName","educationLevel","phone"])if(body[k]!==undefined)u[k]=body[k]?String(body[k]).trim():null;}
