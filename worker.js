@@ -367,10 +367,10 @@ async function uploadToGoogleDrive(env,payload){
   const upstream=await fetchGoogleAppsScript(script,{method:"POST",headers:{"content-type":"text/plain;charset=utf-8"},body:JSON.stringify(payload)});
   const raw=await upstream.text();
   let result=null;try{result=raw?JSON.parse(raw):null;}catch{}
-  if(!upstream.ok)throw new Error("Google Drive upload failed after redirect handling (HTTP "+upstream.status+"): "+String(result?.error||result?.message||raw||"Empty response").slice(0,1200));
-  if(!result||result.error||result.status==="error")throw new Error("Google Drive returned an invalid upload response (HTTP "+upstream.status+"): "+String(result?.error||result?.message||raw||"Invalid JSON response").slice(0,1200));
+  if(!upstream.ok)throw new Error("Google Drive upload failed after redirect handling (HTTP "+upstream.status+"): "+String(result?.error||result?.message||raw||"Empty response").slice(0,2000));
+  if(!result||result.error||result.status==="error")throw new Error("Google Drive returned an invalid upload response (HTTP "+upstream.status+"): "+String(result?.error||result?.message||raw||"Invalid JSON response").slice(0,2000));
   const fileId=typeof result.fileId==="string"&&result.fileId.trim()?result.fileId.trim():typeof result.id==="string"&&result.id.trim()?result.id.trim():"";
-  if(!fileId)throw new Error("Google Drive upload response did not contain fileId (HTTP "+upstream.status+"): "+String(raw||"Empty response").slice(0,1200));
+  if(!fileId)throw new Error("Google Drive upload response did not contain fileId (HTTP "+upstream.status+"): "+String(raw||"Empty response").slice(0,2000));
   return fileId;
 }
 
@@ -419,7 +419,8 @@ async function driveStoreChunk(env,{bytes,fileName,mimeType}){
   return uploadToGoogleDrive(env,{fileName,mimeType,base64:base64FromBytes(bytes)});
 }
 async function mirrorChunkLater(env,uploadId,chunkIndex,bytes,fileName,mimeType){
-  await ensureSchema(env);
+  try{await ensureSchema(env);}
+  catch(error){console.error("TiDB schema initialization failed before Google Drive mirror; continuing with Drive upload",error);}
   try{await recordGoogleDriveSync(env,{uploadId,chunkIndex,fileName,status:"pending"});}
   catch(error){console.error("Could not record Google Drive pending status in TiDB",error);}
   let fileId;
