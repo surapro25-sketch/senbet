@@ -105,7 +105,27 @@ export interface StoredFileUploadResult {
 }
 
 const SINGLE_UPLOAD_LIMIT = 15_000_000;
-const MAX_UPLOAD_LIMIT = 250_000_000;
+const CHUNK_THRESHOLD = 10_000_000;
+const FILE_LIMITS = { pdf: 100_000_000, audio: 50_000_000, video: 200_000_000, other: 50_000_000 } as const;
+const AUDIO_EXTENSIONS = new Set(['mp3', 'wav', 'm4a', 'ogg', 'aac', 'flac']);
+const VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'mov', 'mkv', 'avi']);
+const OTHER_EXTENSIONS = new Set(['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'csv', 'rtf', 'odt', 'ods', 'odp', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
+
+export function validateUploadFile(file: File): string | null {
+  const extension = file.name.toLowerCase().split('.').pop() || '';
+  const kind = extension === 'pdf' || file.type === 'application/pdf' ? 'pdf'
+    : AUDIO_EXTENSIONS.has(extension) || file.type.startsWith('audio/') ? 'audio'
+    : VIDEO_EXTENSIONS.has(extension) || file.type.startsWith('video/') ? 'video'
+    : OTHER_EXTENSIONS.has(extension) || file.type.startsWith('image/') || file.type.startsWith('text/') ? 'other'
+    : null;
+  if (!kind) return 'Unsupported file type. Choose PDF, supported audio/video, or a common document/image file.';
+  const limit = FILE_LIMITS[kind];
+  if (file.size > limit) {
+    const mb = limit / 1_000_000;
+    return `${kind === 'pdf' ? 'PDF' : kind === 'audio' ? 'Audio' : kind === 'video' ? 'Video' : 'Document/image'} files must be ${mb} MB or smaller.`;
+  }
+  return null;
+}
 
 function uploadFormDataWithProgress(
   url: string,
@@ -151,19 +171,18 @@ function uploadFormDataWithProgress(
 
 export async function uploadFileToStorage(
   file: File,
-  onProgress?: (percent: number) => void
+  onProgress?: (percent: number, loadedBytes?: number, totalBytes?: number, status?: string) => void
 ): Promise<StoredFileUploadResult> {
   if (!file || file.size <= 0) {
     throw new Error('እባክዎ ባዶ ያልሆነ ፋይል ይምረጡ።');
   }
-  if (file.size > MAX_UPLOAD_LIMIT) {
-    throw new Error('የፋይሉ መጠን ከ250 MB መብለጥ የለበትም።');
-  }
+  const validationError = validateUploadFile(file);
+  if (validationError) throw new Error(validationError);
 
   const uploadId = crypto.randomUUID();
   const mimeType = file.type || 'application/octet-stream';
-  const totalChunks = Math.ceil(file.size / SINGLE_UPLOAD_LIMIT);
-  onProgress?.(0);
+  const totalChunks = file.size > CHUNK_THRESHOLD ? Math.ceil(file.size / SINGLE_UPLOAD_LIMIT) : 1;
+  onProgress?.(0, 0, file.size, 'Preparing upload');
 
   if (totalChunks === 1) {
     const form = new FormData();
@@ -176,11 +195,11 @@ export async function uploadFileToStorage(
     form.append('file', file, file.name);
 
     await uploadFormDataWithProgress('/api/files/upload', form, (loaded, total) => {
-      onProgress?.(Math.min(95, Math.round((loaded / total) * 95)));
+      onProgress?.(Math.min(95, Math.round((loaded / total) * 95)), loaded, file.size, 'Uploading');
     });
-    onProgress?.(100);
+    onProgress?.(100, file.size, file.size, 'Upload complete');
   } else {
-    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+    let completedBytes = 0;\n    let nextChunk = 0;\n    const workers = Array.from({ length: Math.min(3, totalChunks) }, async () => {\n      while (true) {\n        const chunkIndex = nextChunk++;\n        if (chunkIndex >= totalChunks) return;
       const start = chunkIndex * SINGLE_UPLOAD_LIMIT;
       const end = Math.min(start + SINGLE_UPLOAD_LIMIT, file.size);
       const chunk = file.slice(start, end, mimeType);
@@ -193,17 +212,31 @@ export async function uploadFileToStorage(
       form.append('mimeType', mimeType);
       form.append('file', chunk, file.name);
 
-      await uploadFormDataWithProgress('/api/files/upload-chunk', form, (loaded, total) => {
-        onProgress?.(Math.min(95, Math.round(((start + (loaded / total) * chunk.size) / file.size) * 95)));
-      });
-      onProgress?.(Math.min(95, Math.round((end / file.size) * 95)));
-    }
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await uploadFormDataWithProgress('/api/files/upload-chunk', form, (loaded) => {
+            onProgress?.(Math.min(95, Math.round(((completedBytes + loaded) / file.size) * 95)), completedBytes + loaded, file.size, `Uploading part ${chunkIndex + 1}/${totalChunks}`);
+          });
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+        }
+      }
+      if (lastError) throw lastError;
+      completedBytes += chunk.size;
+      onProgress?.(Math.min(95, Math.round((completedBytes / file.size) * 95)), completedBytes, file.size, `Uploaded part ${chunkIndex + 1}/${totalChunks}`);
+      }
+    });
+    await Promise.all(workers);
 
     await apiFetch('/api/files/finalize', {
       method: 'POST',
       body: JSON.stringify({ uploadId }),
     });
-    onProgress?.(100);
+    onProgress?.(100, file.size, file.size, 'Upload complete');
   }
 
   return { uploadId, originalFileName: file.name, mimeType };
