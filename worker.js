@@ -71,6 +71,7 @@ const DDL = [
   "CREATE TABLE IF NOT EXISTS senbet_kv (key_name VARCHAR(512) NOT NULL PRIMARY KEY, value LONGTEXT NULL, expires_at BIGINT NULL, KEY idx_skv_expires_at (expires_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
   "CREATE TABLE IF NOT EXISTS senbet_migrations (migration_key VARCHAR(64) NOT NULL PRIMARY KEY, cursor_value LONGTEXT NULL, completed TINYINT NOT NULL DEFAULT 0, processed_count BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
   "CREATE TABLE IF NOT EXISTS senbet_finance_transactions (id VARCHAR(64) NOT NULL PRIMARY KEY, type VARCHAR(16) NOT NULL, category VARCHAR(64) NOT NULL, amount DECIMAL(14,2) NOT NULL, description TEXT NULL, party_name VARCHAR(191) NULL, member_id VARCHAR(191) NULL, transaction_date DATE NOT NULL, recorded_by VARCHAR(191) NOT NULL, receipt_upload_id VARCHAR(80) NULL, receipt_file_name VARCHAR(255) NULL, receipt_mime_type VARCHAR(127) NULL, receipt_chunks LONGTEXT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_sft_date (transaction_date), KEY idx_sft_type (type), KEY idx_sft_category (category), KEY idx_sft_member (member_id), KEY idx_sft_date_type (transaction_date,type)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+  "CREATE TABLE IF NOT EXISTS senbet_google_drive_sync (upload_id VARCHAR(80) NOT NULL, chunk_index INT NOT NULL, file_name VARCHAR(255) NOT NULL, sync_status VARCHAR(16) NOT NULL DEFAULT 'pending', google_drive_file_id VARCHAR(191) NULL, error_message TEXT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (upload_id,chunk_index), KEY idx_sgds_status_updated (sync_status,updated_at), KEY idx_sgds_file_id (google_drive_file_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
   "CREATE TABLE IF NOT EXISTS senbet_member_contributions (member_id VARCHAR(191) NOT NULL, contribution_month CHAR(7) NOT NULL, status VARCHAR(16) NOT NULL DEFAULT 'unpaid', amount DECIMAL(14,2) NOT NULL DEFAULT 0, transaction_id VARCHAR(64) NULL, recorded_by VARCHAR(191) NULL, paid_at DATE NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (member_id,contribution_month), KEY idx_smc_month_status (contribution_month,status), KEY idx_smc_member (member_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
 ];
 async function ensureSchema(env) {
@@ -283,6 +284,12 @@ async function getFile(env,kind,id){
   return kind==="report"?{...row,fileUrl:row.pdfUrl,fileName:row.pdfName||"report.pdf"}:row;
 }
 function googleDriveScriptUrl(env){return String(env.GOOGLE_DRIVE_SCRIPT_URL||"").trim();}
+// Apps Script ContentService responds through a 302 to a one-time script.googleusercontent.com URL.
+// Always follow that redirect and consume the final response body, not the intermediate 302.
+async function fetchGoogleAppsScript(url,init={}){return fetch(url,{...init,redirect:"follow"});}
+async function recordGoogleDriveSync(env,{uploadId,chunkIndex,fileName,status,fileId=null,errorMessage=null}){
+  await sql(env,"INSERT INTO senbet_google_drive_sync (upload_id,chunk_index,file_name,sync_status,google_drive_file_id,error_message) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE file_name=VALUES(file_name),sync_status=VALUES(sync_status),google_drive_file_id=VALUES(google_drive_file_id),error_message=VALUES(error_message),updated_at=CURRENT_TIMESTAMP",[uploadId,chunkIndex,fileName,status,fileId,errorMessage]);
+}
 const FILE_TTL_MS=21*24*60*60*1000;
 function expirationTime(row){
   if(Number.isFinite(Number(row?.expiresAt))&&Number(row.expiresAt)>0)return Number(row.expiresAt);
@@ -314,7 +321,7 @@ async function trashGoogleDriveFileId(env,fileId){
   const script=googleDriveScriptUrl(env);
   if(!script)throw new Error("GOOGLE_DRIVE_SCRIPT_URL is not configured; refusing to delete the KV record before its Drive file is trashed.");
   const target=new URL(script);target.searchParams.set("action","delete");target.searchParams.set("fileId",fileId);
-  const response=await fetch(target.toString(),{method:"GET",redirect:"follow"});
+  const response=await fetchGoogleAppsScript(target.toString(),{method:"GET"});
   const raw=await response.text();let result=null;try{result=raw?JSON.parse(raw):null;}catch{}
   if(!response.ok||result?.error||result?.ok===false||result?.status==="error")throw new Error("Google Drive trash request failed ("+response.status+"): "+String(result?.error||result?.message||raw||"Unknown response").slice(0,300));
   return true;
@@ -345,7 +352,7 @@ async function createGoogleDriveUploadSession(env,{fileName,mimeType,fileSize}){
   const script=googleDriveScriptUrl(env);if(!script)return err("የGoogle Drive ማገናኛ አልተዋቀረም።",503);
   try{
     const sessionEndpoint=new URL(script);sessionEndpoint.searchParams.set("action","createUploadSession");
-    const upstream=await fetch(sessionEndpoint.toString(),{method:"POST",headers:{"content-type":"text/plain;charset=utf-8"},body:JSON.stringify({fileName,mimeType,fileSize}),redirect:"follow"});
+    const upstream=await fetchGoogleAppsScript(sessionEndpoint.toString(),{method:"POST",headers:{"content-type":"text/plain;charset=utf-8"},body:JSON.stringify({fileName,mimeType,fileSize})});
     const raw=await upstream.text();let result=null;try{result=raw?JSON.parse(raw):null;}catch{}
     if(!upstream.ok||!result||result.error)return err(result?.error||result?.message||"Google Drive የመጫኛ ክፍለ ጊዜ መፍጠር አልቻለም።",502);
     const uploadUrl=String(result.uploadUrl||"").trim();
@@ -356,21 +363,15 @@ async function createGoogleDriveUploadSession(env,{fileName,mimeType,fileSize}){
 }
 async function uploadToGoogleDrive(env,payload){
   const script=googleDriveScriptUrl(env);
-  if(!script)return err("የGoogle Drive ማገናኛ አልተዋቀረም።",503);
-  try{
-    const upstream=await fetch(script,{method:"POST",headers:{"content-type":"text/plain;charset=utf-8"},body:JSON.stringify(payload),redirect:"follow"});
-    const raw=await upstream.text();
-    let result=null;
-    try{result=raw?JSON.parse(raw):null;}catch{}
-    if(!upstream.ok)return err(result?.error||result?.message||"Google Drive ላይ ፋይሉን መጫን አልተቻለም።",502);
-    if(!result||result.error||result.status==="error")return err(result?.error||result?.message||"Google Drive ትክክለኛ ምላሽ አልመለሰም።",502);
-    const fileId=typeof result.fileId==="string"&&result.fileId.trim()?result.fileId.trim():typeof result.id==="string"&&result.id.trim()?result.id.trim():"";
-    if(!fileId)return err("Google Drive የፋይል መለያ (fileId) አልመለሰም።",502);
-    return json({fileId});
-  }catch(e){
-    console.error("Google Drive upload failed",e);
-    return err("ወደ Google Drive መጫን አልተቻለም።",502);
-  }
+  if(!script)throw new Error("GOOGLE_DRIVE_SCRIPT_URL is not configured.");
+  const upstream=await fetchGoogleAppsScript(script,{method:"POST",headers:{"content-type":"text/plain;charset=utf-8"},body:JSON.stringify(payload)});
+  const raw=await upstream.text();
+  let result=null;try{result=raw?JSON.parse(raw):null;}catch{}
+  if(!upstream.ok)throw new Error("Google Drive upload failed after redirect handling (HTTP "+upstream.status+"): "+String(result?.error||result?.message||raw||"Empty response").slice(0,1200));
+  if(!result||result.error||result.status==="error")throw new Error("Google Drive returned an invalid upload response (HTTP "+upstream.status+"): "+String(result?.error||result?.message||raw||"Invalid JSON response").slice(0,1200));
+  const fileId=typeof result.fileId==="string"&&result.fileId.trim()?result.fileId.trim():typeof result.id==="string"&&result.id.trim()?result.id.trim():"";
+  if(!fileId)throw new Error("Google Drive upload response did not contain fileId (HTTP "+upstream.status+"): "+String(raw||"Empty response").slice(0,1200));
+  return fileId;
 }
 
 const UPLOAD_CHUNK_SIZE=15000000;
@@ -415,15 +416,26 @@ async function telegramStoreChunk(env,{blob,fileName,mimeType}){
   throw lastError||new Error("Telegram upload failed.");
 }
 async function driveStoreChunk(env,{bytes,fileName,mimeType}){
-  if(!googleDriveScriptUrl(env))throw new Error("Google Drive storage is not configured.");
-  const response=await uploadToGoogleDrive(env,{fileName,mimeType,base64:base64FromBytes(bytes)});
-  const data=await response.json().catch(()=>null);
-  if(!response.ok||!data?.fileId)throw new Error(data?.error||"Google Drive chunk upload failed.");
-  return data.fileId;
+  return uploadToGoogleDrive(env,{fileName,mimeType,base64:base64FromBytes(bytes)});
 }
 async function mirrorChunkLater(env,uploadId,chunkIndex,bytes,fileName,mimeType){
+  await ensureSchema(env);
+  try{await recordGoogleDriveSync(env,{uploadId,chunkIndex,fileName,status:"pending"});}
+  catch(error){console.error("Could not record Google Drive pending status in TiDB",error);}
+  let fileId;
   try{
-    const fileId=await driveStoreChunk(env,{bytes,fileName,mimeType});
+    fileId=await driveStoreChunk(env,{bytes,fileName,mimeType});
+  }catch(error){
+    const message=String(error?.message||error||"Unknown Google Drive error").slice(0,2000);
+    try{await recordGoogleDriveSync(env,{uploadId,chunkIndex,fileName,status:"failed",errorMessage:message});}
+    catch(dbError){console.error("Could not persist Google Drive failure status in TiDB",dbError);}
+    console.warn("Background Google Drive mirror failed; Telegram copy remains permanent",message);
+    return;
+  }
+  try{
+    await recordGoogleDriveSync(env,{uploadId,chunkIndex,fileName,status:"synced",fileId,errorMessage:null});
+  }catch(error){console.error("Google Drive upload succeeded but its TiDB sync status could not be persisted",error);}
+  try{
     const chunkKey="upload:"+uploadId+":chunk:"+chunkIndex,chunkRaw=await kvGet(env,chunkKey);let chunk=null;try{chunk=chunkRaw?JSON.parse(chunkRaw):null;}catch{}
     if(!chunk)return;
     chunk.googleDriveFileId=fileId;await kvPut(env,chunkKey,JSON.stringify(chunk),{expirationTtl:86400});
@@ -438,7 +450,7 @@ async function mirrorChunkLater(env,uploadId,chunkIndex,bytes,fileName,mimeType)
       if(row){row.storageChunks=chunks;row.googleDriveFileIds=chunks.map(value=>value.googleDriveFileId||null);await put(env,table,row);}
     }
     await sql(env,"UPDATE senbet_finance_transactions SET receipt_chunks=? WHERE receipt_upload_id=?",[JSON.stringify(chunks),uploadId]);
-  }catch(error){console.warn("Background Google Drive mirror failed; Telegram copy remains permanent",error);}
+  }catch(error){console.error("Google Drive mirror succeeded, but SENBET file metadata synchronization failed",error);}
 }
 async function uploadChunkCore(env,actor,body,ctx){
   const blob=body.file;
