@@ -69,7 +69,9 @@ const DDL = [
   "CREATE TABLE IF NOT EXISTS senbet_reports (id VARCHAR(191) NOT NULL PRIMARY KEY, department VARCHAR(191) NULL, submitted_by VARCHAR(191) NULL, status VARCHAR(32) NULL, title VARCHAR(255) NULL, created_at DATETIME NULL, expires_at BIGINT NULL, payload LONGTEXT NOT NULL, KEY idx_sp_department_status (department, status), KEY idx_sp_submitted_by (submitted_by), KEY idx_sp_created_at (created_at), KEY idx_sp_expires_at (expires_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
   "CREATE TABLE IF NOT EXISTS senbet_records (table_name VARCHAR(64) NOT NULL, record_id VARCHAR(191) NOT NULL, created_at DATETIME NULL, payload LONGTEXT NOT NULL, PRIMARY KEY (table_name, record_id), KEY idx_srec_record_id (record_id), KEY idx_srec_created_at (created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
   "CREATE TABLE IF NOT EXISTS senbet_kv (key_name VARCHAR(512) NOT NULL PRIMARY KEY, value LONGTEXT NULL, expires_at BIGINT NULL, KEY idx_skv_expires_at (expires_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-  "CREATE TABLE IF NOT EXISTS senbet_migrations (migration_key VARCHAR(64) NOT NULL PRIMARY KEY, cursor_value LONGTEXT NULL, completed TINYINT NOT NULL DEFAULT 0, processed_count BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+  "CREATE TABLE IF NOT EXISTS senbet_migrations (migration_key VARCHAR(64) NOT NULL PRIMARY KEY, cursor_value LONGTEXT NULL, completed TINYINT NOT NULL DEFAULT 0, processed_count BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+  "CREATE TABLE IF NOT EXISTS senbet_finance_transactions (id VARCHAR(64) NOT NULL PRIMARY KEY, type VARCHAR(16) NOT NULL, category VARCHAR(64) NOT NULL, amount DECIMAL(14,2) NOT NULL, description TEXT NULL, party_name VARCHAR(191) NULL, member_id VARCHAR(191) NULL, transaction_date DATE NOT NULL, recorded_by VARCHAR(191) NOT NULL, receipt_upload_id VARCHAR(80) NULL, receipt_file_name VARCHAR(255) NULL, receipt_chunks LONGTEXT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_sft_date (transaction_date), KEY idx_sft_type (type), KEY idx_sft_category (category), KEY idx_sft_member (member_id), KEY idx_sft_date_type (transaction_date,type)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+  "CREATE TABLE IF NOT EXISTS senbet_member_contributions (member_id VARCHAR(191) NOT NULL, contribution_month CHAR(7) NOT NULL, status VARCHAR(16) NOT NULL DEFAULT 'unpaid', amount DECIMAL(14,2) NOT NULL DEFAULT 0, transaction_id VARCHAR(64) NULL, recorded_by VARCHAR(191) NULL, paid_at DATE NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (member_id,contribution_month), KEY idx_smc_month_status (contribution_month,status), KEY idx_smc_member (member_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
 ];
 async function ensureSchema(env) {
   let ready = schemaReady.get(env);
@@ -271,7 +273,15 @@ async function auth(req,env){const token=(req.headers.get("authorization")||"").
 const joinedUser=(row,u,fields={})=>({...row,...fields});
 async function withUser(env,row,field){const u=await get(env,"users",row[field]);return u?{...row,[field==="uploadedBy"?"uploaderName":field==="submittedBy"?"submitterName":"senderName"]:u.fullName,...(field==="uploadedBy"?{uploaderRole:u.role}:{})}:row;}
 async function enriched(env,rows,foreign,extra){const out=[];for(const r of rows){const u=await get(env,"users",r[foreign]);out.push({...r,...(u?extra(u):{})});}return out;}
-async function getFile(env,kind,id){const table=kind==="resource"?"resources":kind==="material"?"materials":kind==="report"?"reports":null;const row=table?await get(env,table,Number(id)):null;if(!row)return null;return kind==="report"?{...row,fileUrl:row.pdfUrl,fileName:row.pdfName||"report.pdf"}:row;}
+async function getFile(env,kind,id){
+  if(kind==="finance"){
+    const row=await financeTransactionById(env,String(id));
+    return row?.receiptChunks?.length?{fileUrl:"",fileName:row.receiptFileName||"receipt",storageChunks:row.receiptChunks}:null;
+  }
+  const table=kind==="resource"?"resources":kind==="material"?"materials":kind==="report"?"reports":null;
+  const row=table?await get(env,table,Number(id)):null;if(!row)return null;
+  return kind==="report"?{...row,fileUrl:row.pdfUrl,fileName:row.pdfName||"report.pdf"}:row;
+}
 function googleDriveScriptUrl(env){return String(env.GOOGLE_DRIVE_SCRIPT_URL||"").trim();}
 const FILE_TTL_MS=21*24*60*60*1000;
 function expirationTime(row){
@@ -579,6 +589,101 @@ async function legacyCreateStoredFile(body){
   if(!name||!drive||/\s/.test(drive))return null;
   return {fileUrl:"gdrive:"+drive,fileName:name,resourceType:resourceType(name,mime,body.resourceType||body.fileType)};
 }
+async function financeAccess(actor,write=false){
+  if(!["head","accountant"].includes(actor?.role))return err("የፋይናንስ መረጃን ለማየት ፈቃድ የለዎትም።",403);
+  if(write&&actor.role!=="accountant")return err("የሂሳብ መዝገብ ለመቀየር የሂሳብ ሹም ፈቃድ ያስፈልጋል።",403);
+  return null;
+}
+function financeTransactionRow(row){
+  return {...row,amount:Number(row.amount||0),memberId:row.member_id||null,partyName:row.party_name||"",transactionDate:String(row.transaction_date||"").slice(0,10),recordedBy:row.recorded_by,receiptUploadId:row.receipt_upload_id||null,receiptFileName:row.receipt_file_name||null,receiptChunks:parsePayload(row.receipt_chunks)||[]};
+}
+async function financeTransactionById(env,id){
+  const rows=await sql(env,"SELECT * FROM senbet_finance_transactions WHERE id = ? LIMIT 1",[id]);
+  return rows[0]?financeTransactionRow(rows[0]):null;
+}
+async function financeReceipt(env,uploadId,actor){
+  if(!uploadId)return {uploadId:null,fileName:null,chunks:null};
+  const raw=await kvGet(env,"upload:"+uploadId);let stage=null;try{stage=raw?JSON.parse(raw):null;}catch{}
+  if(!stage||!stage.finalized||stage.userId!==actor.id)return null;
+  return {uploadId,fileName:preserveFileName(stage.originalName),chunks:JSON.stringify(stage.chunks||[])};
+}
+async function financeList(env,query){
+  const where=[],params=[];
+  const from=query.get("from"),to=query.get("to"),type=query.get("type"),category=query.get("category");
+  if(from&&/^\d{4}-\d{2}-\d{2}$/.test(from)){where.push("transaction_date >= ?");params.push(from);}
+  if(to&&/^\d{4}-\d{2}-\d{2}$/.test(to)){where.push("transaction_date <= ?");params.push(to);}
+  if(["income","expense"].includes(type)){where.push("type = ?");params.push(type);}
+  if(category&&/^[a-z_]{2,64}$/.test(category)){where.push("category = ?");params.push(category);}
+  const rows=await sql(env,"SELECT * FROM senbet_finance_transactions"+(where.length?" WHERE "+where.join(" AND "):"")+" ORDER BY transaction_date DESC, created_at DESC LIMIT 2000",params);
+  const totals=await sql(env,"SELECT COALESCE(SUM(CASE WHEN type='income' THEN amount ELSE 0 END),0) AS total_income, COALESCE(SUM(CASE WHEN type='expense' THEN amount ELSE 0 END),0) AS total_expenses FROM senbet_finance_transactions");
+  return {transactions:rows.map(financeTransactionRow),summary:{totalIncome:Number(totals[0]?.total_income||0),totalExpenses:Number(totals[0]?.total_expenses||0),balance:Number(totals[0]?.total_income||0)-Number(totals[0]?.total_expenses||0)}};
+}
+async function financeContributionList(env,month){
+  const rows=await sql(env,"SELECT member_id, contribution_month, status, amount, transaction_id, paid_at FROM senbet_member_contributions WHERE contribution_month = ?",[month]);
+  const users=(await all(env,"users")).filter(user=>["student","dept_member"].includes(user.role));
+  const byId=new Map(rows.map(row=>[String(row.member_id),row]));
+  return users.map(user=>{const row=byId.get(String(user.id));return {memberId:user.id,memberName:user.fullName,role:user.role,grade:user.assignedGrade||null,status:row?.status||"unpaid",amount:Number(row?.amount||0),transactionId:row?.transaction_id||null,paidAt:row?.paid_at?String(row.paid_at).slice(0,10):null};}).sort((a,b)=>a.memberName.localeCompare(b.memberName));
+}
+async function handleFinance(request,env,actor,body){
+  const denied=await financeAccess(actor,false);if(denied)return denied;
+  const url=new URL(request.url),path=url.pathname,method=request.method;
+  if(path==="/api/finance"&&method==="GET"){
+    const month=url.searchParams.get("month")||new Date().toISOString().slice(0,7);
+    if(!/^\d{4}-\d{2}$/.test(month))return err("የወሩ ቅርጽ ትክክል አይደለም።",400);
+    const [ledger,contributions]=await Promise.all([financeList(env,url.searchParams),financeContributionList(env,month)]);
+    return json({...ledger,contributions,month,canWrite:actor.role==="accountant"});
+  }
+  const transactionMatch=path.match(/^\/api\/finance\/transactions\/([A-Za-z0-9_-]{16,64})$/);
+  if(path==="/api/finance/transactions"&&method==="POST"){
+    const writeDenied=await financeAccess(actor,true);if(writeDenied)return writeDenied;
+    const type=body.type,category=String(body.category||"");
+    const categories=["monthly_contribution","donation","event_income","materials","other"];
+    const amount=Number(body.amount),date=String(body.transactionDate||"");
+    if(!["income","expense"].includes(type)||!categories.includes(category)||!Number.isFinite(amount)||amount<=0||amount>999999999999||!/^\d{4}-\d{2}-\d{2}$/.test(date))return err("የገቢ/ወጪ መረጃውን በትክክል ያስገቡ።",400);
+    const receipt=await financeReceipt(env,String(body.receiptUploadId||""),actor);if(!receipt)return err("የደረሰኙ ፋይል አልተገኘም፤ እባክዎ እንደገና ይጫኑ።",400);
+    const id=crypto.randomUUID().replace(/-/g,"");
+    await sql(env,"INSERT INTO senbet_finance_transactions (id,type,category,amount,description,party_name,member_id,transaction_date,recorded_by,receipt_upload_id,receipt_file_name,receipt_chunks) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",[id,type,category,amount,String(body.description||"").trim(),String(body.partyName||"").trim(),body.memberId?String(body.memberId):null,date,String(actor.id),receipt.uploadId,receipt.fileName,receipt.chunks]);
+    return json({transaction:await financeTransactionById(env,id)},201);
+  }
+  if(transactionMatch&&method==="PATCH"){
+    const writeDenied=await financeAccess(actor,true);if(writeDenied)return writeDenied;
+    const id=transactionMatch[1],old=await financeTransactionById(env,id);if(!old)return err("የሂሳብ መዝገቡ አልተገኘም።",404);
+    const type=body.type??old.type,category=String(body.category??old.category),amount=Number(body.amount??old.amount),date=String(body.transactionDate??old.transactionDate);
+    if(!["income","expense"].includes(type)||!["monthly_contribution","donation","event_income","materials","other"].includes(category)||!Number.isFinite(amount)||amount<=0||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(date))return err("የገቢ/ወጪ መረጃውን በትክክል ያስገቡ።",400);
+    const receipt=body.receiptUploadId?await financeReceipt(env,String(body.receiptUploadId),actor):{uploadId:old.receiptUploadId,fileName:old.receiptFileName,chunks:old.receiptChunks?JSON.stringify(old.receiptChunks):null};
+    if(!receipt)return err("የደረሰኙ ፋይል አልተገኘም።",400);
+    await sql(env,"UPDATE senbet_finance_transactions SET type=?,category=?,amount=?,description=?,party_name=?,member_id=?,transaction_date=?,receipt_upload_id=?,receipt_file_name=?,receipt_chunks=? WHERE id=?",[type,category,amount,String(body.description??old.description??"").trim(),String(body.partyName??old.partyName??"").trim(),body.memberId?String(body.memberId):null,date,receipt.uploadId,receipt.fileName,receipt.chunks,id]);
+    return json({transaction:await financeTransactionById(env,id)});
+  }
+  if(transactionMatch&&method==="DELETE"){
+    const writeDenied=await financeAccess(actor,true);if(writeDenied)return writeDenied;
+    await sql(env,"DELETE FROM senbet_finance_transactions WHERE id=?",[transactionMatch[1]]);
+    await sql(env,"UPDATE senbet_member_contributions SET transaction_id=NULL WHERE transaction_id=?",[transactionMatch[1]]);
+    return json({ok:true});
+  }
+  if(path==="/api/finance/contributions"&&method==="POST"){
+    const writeDenied=await financeAccess(actor,true);if(writeDenied)return writeDenied;
+    const memberId=String(body.memberId||""),month=String(body.month||""),status=body.status==="paid"?"paid":"unpaid",amount=Number(body.amount||0);
+    if(!/^\d+$/.test(memberId)||!/^\d{4}-\d{2}$/.test(month)||!Number.isFinite(amount)||amount<0)return err("የወርሃዊ መዋጮ መረጃው ትክክል አይደለም።",400);
+    const user=await get(env,"users",Number(memberId));if(!user||!["student","dept_member"].includes(user.role))return err("አባሉ አልተገኘም።",404);
+    const oldRows=await sql(env,"SELECT transaction_id, amount FROM senbet_member_contributions WHERE member_id=? AND contribution_month=? LIMIT 1",[memberId,month]);
+    let transactionId=oldRows[0]?.transaction_id||null;
+    if(status==="paid"){
+      if(!transactionId){
+        transactionId=crypto.randomUUID().replace(/-/g,"");
+        await sql(env,"INSERT INTO senbet_finance_transactions (id,type,category,amount,description,party_name,member_id,transaction_date,recorded_by) VALUES (?,'income','monthly_contribution',?,?,?,?,?,?)",[transactionId,amount,"Monthly contribution "+month,user.fullName,memberId,month+"-01",String(actor.id)]);
+      }else{
+        await sql(env,"UPDATE senbet_finance_transactions SET amount=?,transaction_date=?,recorded_by=? WHERE id=?",[amount,month+"-01",String(actor.id),transactionId]);
+      }
+    }else if(transactionId){
+      await sql(env,"DELETE FROM senbet_finance_transactions WHERE id=?",[transactionId]);transactionId=null;
+    }
+    await sql(env,"INSERT INTO senbet_member_contributions (member_id,contribution_month,status,amount,transaction_id,recorded_by,paid_at) VALUES (?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE status=VALUES(status),amount=VALUES(amount),transaction_id=VALUES(transaction_id),recorded_by=VALUES(recorded_by),paid_at=VALUES(paid_at)",[memberId,month,status,amount,transactionId,String(actor.id),status==="paid"?month+"-01":null]);
+    return json({ok:true,memberId:Number(memberId),month,status,amount,transactionId});
+  }
+  return null;
+}
+
 async function handler(request,env,ctx){
   const url=new URL(request.url),path=url.pathname,method=request.method;
   if(method==="GET"&&path==="/googleba7f61ba454e7933.html"){
@@ -629,8 +734,12 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
   const a=await auth(request,env),needsAuth=!["/api/auth/login","/api/auth/register-student"].includes(path);
   if(needsAuth&&a.error)return err(a.error,a.status);
   const actor=a.user;
+  if(path==="/api/finance"||path.startsWith("/api/finance/")){
+    const financeResponse=await handleFinance(request,env,actor,body);
+    if(financeResponse)return financeResponse;
+  }
   if(path==="/api/files/upload-session"&&method==="POST"){
-    if(!["head","teacher","dept_head"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
+    if(!["head","teacher","dept_head","accountant"].includes(actor.role))return err("ፈቃድ የለዎትም።",403);
     const fileName=safeName(body.fileName),mimeType=String(body.mimeType||"application/octet-stream").trim(),fileSize=Number(body.fileSize);
     if(!fileName||!Number.isSafeInteger(fileSize)||fileSize<=0)return err("የፋይል መረጃው ትክክል አይደለም።",400);
     const validation=validateUpload(fileName,mimeType,fileSize);if(validation.error)return err(validation.error,413);
@@ -709,7 +818,7 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
     if(!body.username||!body.password||!body.fullName)return err("ሙሉ ስም፣ የመግቢያ ስም እና የይለፍ ቃል ያስፈልጋሉ።");
     const users=await all(env,"users");if(users.some(u=>u.username===String(body.username).trim()))return err("ይህ የመግቢያ ስም (Username) አስቀድሞ አለ።",409);
     let role,dept=body.department||null,grade=body.assignedGrade?Number(body.assignedGrade):null;
-    if(actor.role==="head"){if(!["head","teacher","student","dept_head","dept_member"].includes(body.role))return err("ትክክለኛ የስራ ድርሻ (Role) ይምረጡ።");role=body.role;if(role==="student"&&!grade&&body.age)grade=gradeByAge(Number(body.age));}
+    if(actor.role==="head"){if(!["head","teacher","student","dept_head","dept_member","accountant"].includes(body.role))return err("ትክክለኛ የስራ ድርሻ (Role) ይምረጡ።");role=body.role;if(role==="student"&&!grade&&body.age)grade=gradeByAge(Number(body.age));}
     else if(actor.role==="dept_head"&&actor.department){role="dept_member";dept=actor.department;grade=null;}
     else return err("አዲስ አባል ወይም መምህር ለመመዝገብ ፈቃድ የለዎትም።",403);
     const salt=crypto.getRandomValues(new Uint8Array(16)),id=await nextId(env,"users"),u={id,username:String(body.username).trim(),passwordHash:await hashPassword(String(body.password),salt),passwordSalt:Array.from(salt),fullName:String(body.fullName).trim(),role,age:body.age?Number(body.age):null,educationLevel:body.educationLevel?String(body.educationLevel).trim():null,assignedGrade:grade,department:dept,subject:role==="teacher"&&body.subject?String(body.subject).trim():null,phone:body.phone?String(body.phone).trim():null,createdAt:now()};await put(env,"users",u);return json({user:safeUser(u)},201);
@@ -729,7 +838,7 @@ Sitemap: https://senbet.1surapro25.workers.dev/sitemap.xml
     const targetId=Number(idMatch[2]);if(actor.role!=="head")return err("መለያ ለመሰረዝ የሀላፊ ፈቃድ ያስፈልጋል።",403);if(actor.id===targetId)return err("የራስዎን ዋና ሀላፊ መለያ መሰረዝ አይችሉም።");await remove(env,"users",targetId);for(const s of await all(env,"sessions"))if(s.userId===targetId)await remove(env,"sessions",s.token);return json({ok:true});
   }
   if(path==="/api/files/upload-config"&&method==="GET"){
-    if(!["head","teacher","dept_head"].includes(actor.role))return json({enabled:false,scriptUrl:null});const script=googleDriveScriptUrl(env);return json({enabled:!!script,scriptUrl:script||null});
+    if(!["head","teacher","dept_head","accountant"].includes(actor.role))return json({enabled:false,scriptUrl:null});const script=googleDriveScriptUrl(env);return json({enabled:!!script,scriptUrl:script||null});
   }
   // Educational resources
   if(path==="/api/resources"&&method==="GET"){
